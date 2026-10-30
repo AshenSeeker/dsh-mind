@@ -1,0 +1,82 @@
+{
+  "name": "dsh-mind",
+  "version": "0.14.5",
+  "description": "DeepSeek Harness 心智插件（dsh-mood 的精简 fork）：33 种心情各有数值，每 3~6 小时自动判定，用户消息小幅累积加减分，达到余量才切换，支持混合心情；附带加密心情日记、跨会话可检索的硬盘记忆、跨会话审美品味库、可选的主动开口。各模块可独立开关，数据可迁移到任意盘。",
+  "type": "module",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "files": [
+    "index.js",
+    "client.js",
+    "proactive.js",
+    "memory.js",
+    "store.js",
+    "diary.js",
+    "sessions.js",
+    "sidx.js",
+    "ownergate.js",
+    "procedures.js",
+    "taste.js",
+    "README.md",
+    "PORTING.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "cordis.patch.yml",
+    "icon.svg"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./store": "./store.js",
+    "./diary": "./diary.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./proactive": "./proactive.js",
+    "./sessions": "./sessions.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "deepseek-harness",
+    "deepseek",
+    "mood",
+    "emotion",
+    "persona",
+    "prompt",
+    "agent",
+    "心智",
+    "心情"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wld12314/dsh-mind.git"
+  },
+  "homepage": "https://github.com/wld12314/dsh-mind#readme",
+  "bugs": {
+    "url": "https://github.com/wld12314/dsh-mind/issues"
+  },
+  "author": "wld12314 <wld12314@users.noreply.github.com>",
+  "devDependencies": {},
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check memory.js && node --check taste.js && node --check diary.js && node --check proactive.js && node --check store.js && node --check sidx.js && node --check ownergate.js && node --check procedures.js && node --check sessions.js"
+  }
+}
