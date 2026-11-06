@@ -117,7 +117,7 @@ DSH 插件就是**一个包**。你那台机器上的 profile 长这样（`~/.ds
 // package.json
 {
   "dependencies": {
-    "dsh-mind": "github:wld12314/dsh-mind"   // 或 "file:/你克隆下来的路径"
+    "dsh-mind": "github:AshenSeeker/dsh-mind"   // 或 "file:/你克隆下来的路径"
   },
   "dsh": {
     "profile": {
@@ -140,7 +140,7 @@ cd ~/.dsh/profiles/desktop && pnpm install
 **然后重启 DSH。**
 
 > **⚠️ 这个插件没有发布到 npm** —— 能用的来源只有这两种：
-> `github:wld12314/dsh-mind` 或 `file:/你克隆下来的路径`。
+> `github:AshenSeeker/dsh-mind` 或 `file:/你克隆下来的路径`。
 
 装完**不用配任何东西** —— 心情会自己开始变。
 日记默认**不自动生成**（`diary.autoDraft` 为 `false`）：插件只攒素材，正文等我自己写。

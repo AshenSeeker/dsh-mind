@@ -68,13 +68,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wld12314/dsh-mind.git"
+    "url": "git+https://github.com/AshenSeeker/dsh-mind.git"
   },
-  "homepage": "https://github.com/wld12314/dsh-mind#readme",
+  "homepage": "https://github.com/AshenSeeker/dsh-mind#readme",
   "bugs": {
-    "url": "https://github.com/wld12314/dsh-mind/issues"
+    "url": "https://github.com/AshenSeeker/dsh-mind/issues"
   },
-  "author": "wld12314 <wld12314@users.noreply.github.com>",
+  "author": "AshenSeeker <AshenSeeker@users.noreply.github.com>",
   "devDependencies": {},
   "scripts": {
     "check": "node --check index.js && node --check client.js && node --check memory.js && node --check taste.js && node --check diary.js && node --check proactive.js && node --check store.js && node --check sidx.js && node --check ownergate.js && node --check procedures.js && node --check sessions.js"
