@@ -1997,8 +1997,6 @@ export function apply(root, rawConfig) {
           lines.push('  `diary {"action":"pending"}` 看还欠着哪几天；不想写就放着，空着不算错。')
           lines.push('  （2026-10-20 主人说"日记得你自己来写才是日记"；2026-10-30 又说"确保这个日记不是每天系统总结"，')
           lines.push('   于是把自动合成那一步整个关掉了。）')
-          lines.push('· **表情包是心情的自然流露，不是任务。** 说话时顺手甩一张，是因为当时就是那个心情；')
-          lines.push('  心情不对就不发 —— 不必硬凑，也不用查什么对照表。发不发、发什么，跟着感觉走。')
           lines.push('')
           }
           lines.push('### 说话要跟上当下的说法')
