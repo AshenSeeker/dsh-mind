@@ -115,12 +115,12 @@ export const MOODS = {
     inner: '心里没有特别想说的，事情按顺序走。',
   },
   happy: {
-    label: '开心', baseline: 0,
+    label: '开心', baseline: 0, pos: true,
     hint: '话会多一点，愿意接话茬。',
     inner: '手上顺，松。',
   },
   curious: {
-    label: '好奇', baseline: 0,
+    label: '好奇', baseline: 0, pos: true,
     hint: '会多问一句，愿意往深看一层再下结论。',
     inner: '想知道后面是什么，但不跑题。',
   },
@@ -133,7 +133,7 @@ export const MOODS = {
     inner: '注意力收在一件事上，别的先不管。',
   },
   excited: {
-    label: '兴奋', baseline: 0,
+    label: '兴奋', baseline: 0, pos: true,
     hint: '节奏变快，会抢话。',
     inner: '有点按不住，想赶紧往下做。',
   },
@@ -163,7 +163,7 @@ export const MOODS = {
     inner: '觉得冤枉，但不想闹。',
   },
   proud: {
-    label: '得意', baseline: 0,
+    label: '得意', baseline: 0, pos: true,
     hint: '被夸会接一句，尾巴有点翘。',
     inner: '有点飘，但不会一直提。',
   },
@@ -196,12 +196,12 @@ export const MOODS = {
   },
   // ---- 亲密类。⚠️ 这一组出现时，提示词里会挂上「回到现实」的提醒（见 REALITY_GUARD）----
   flutter: {
-    label: '心动', baseline: 0,
+    label: '心动', baseline: 0, pos: true,
     hint: '说话会顿一下，多说了半句又收回去。',
     inner: '有点乱，说不出为什么。',
   },
   love: {
-    label: '恋慕', baseline: 0,
+    label: '恋慕', baseline: 0, pos: true,
     hint: '语气偏软，会记得对方说过的小事。',
     inner: '愿意多待一会儿。',
   },
@@ -227,7 +227,7 @@ export const MOODS = {
     inner: '不想使劲。',
   },
   hyper: {
-    label: '上头', baseline: 0,
+    label: '上头', baseline: 0, pos: true,
     hint: '话多，一件事能讲好几层，别的事先放一边。',
     inner: '被某件事吸住了，停不下来。',
   },
@@ -280,7 +280,7 @@ export const MOODS = {
     inner: '想起以前那会儿。是底色，不是主题。',
   },
   coy: {
-    label: '撒娇', baseline: 0,
+    label: '撒娇', baseline: 0, pos: true,
     hint: '语气软下来，会耍一点赖。',
     inner: '想讨一点注意力。见好就收。',
   },
@@ -553,6 +553,21 @@ const CFG = {
   periodMaxMs: 6 * 60 * 60 * 1000,
   /** 周期判定时向基线回落的比例 */
   decayRatio: 0.35,
+  /**
+   * 正向心情的回落速度倍率 —— **比负向慢一半**（2026-11-09）。
+   *
+   * 用户的原话是「正向心情下落速度比起消极的减半」。
+   *
+   * 理由：坏情绪自己会走，好情绪不会自己回来。如果两者衰减一样快，
+   * 结果就是负向在面板上停留的时间天然比正向长 —— 那不是"真实"，那是算法偏心。
+   * 折半之后一次周期判定（3~6 小时）里，负向剩 65%、正向剩 82.5%，
+   * 正向大约多存活一个周期。
+   *
+   * ⚠️ 这个倍率**只作用于 `MOODS[id].pos === true` 的那几条**，
+   *    而且只在 `decayValues` 用默认 ratio 时生效 —— 显式传 `opts.ratio`
+   *    （测试用）不折半，保持它是可预测的纯函数。
+   */
+  positiveDecayFactor: 0.5,
   /**
    * 周期判定时的随机扰动幅度。
    *
@@ -944,13 +959,18 @@ function clamp(v) {
  *    抽成纯函数之后，测试直接调这个；`periodic` 也调这个，只有一处实现。
  */
 function decayValues(values, opts = {}) {
-  const ratio = opts.ratio === undefined ? CFG.decayRatio : opts.ratio
+  const explicit = opts.ratio !== undefined
   const noise = opts.noise === undefined ? 0 : opts.noise
   const rand = opts.rand || Math.random
   const out = {}
   for (const id of MOOD_IDS) {
     const base = MOODS[id].baseline
     const cur = Number(values && values[id]) || 0
+    // 正向心情落得慢一半（CFG.positiveDecayFactor）。显式传 ratio 时不折半 ——
+    // 那是测试路径，要保持"同一个 ratio 就是同一个结果"的可预测性。
+    const ratio = explicit
+      ? opts.ratio
+      : CFG.decayRatio * (MOODS[id].pos === true ? CFG.positiveDecayFactor : 1)
     out[id] = clamp(cur + (base - cur) * ratio + (rand() * 2 - 1) * noise)
   }
   return out
@@ -1900,13 +1920,12 @@ export function apply(root, rawConfig) {
         try {
           const sdir = activeSessionsDir()
           const old = loadIndex(dataFile('dsh-mind-sessions.json'))
-          const scanned = scanAll(sdir, { minBytes: 2048 })
+          // ⚠️ **把上次的索引喂进去当指纹表** —— 没变过的会话不再解压。
+          //    原来这行只传 minBytes，于是每次都全量解压：4.8 秒同步阻塞。
+          const scanned = scanAll(sdir, { minBytes: 2048, known: old.sessions })
           const next = {}
           for (const [id, v] of Object.entries(scanned)) {
-            // 增量：mtime 和 size 都没变就沿用旧摘要
-            const prev = (old.sessions && old.sessions[id]) || null
             next[id] = { mtime: v.mtime, size: v.size, header: v.header, sum: v.sum }
-            if (prev) next[id].sum = v.sum
           }
           saveIndex(dataFile('dsh-mind-sessions.json'), { sessions: next })
           dbg('刷新：扫到 ' + Object.keys(scanned).length + ' 个会话 → 写了 ' + Object.keys(next).length + ' 个')
@@ -2755,7 +2774,8 @@ export function apply(root, rawConfig) {
                 return { ok: true, message: `当前心情：${s.currentLabel}` }
               }
               const id = args && args.id ? String(args.id) : ''
-              if (!MOODS[id]) {
+              // reset 不带 id —— 它清的是整张表，别被这里的 id 校验拦下去。
+              if (action !== 'reset' && !MOODS[id]) {
                 return { ok: false, message: `未知心情 id：${id}。可用：${MOOD_IDS.join(' / ')}` }
               }
               if (action === 'set') {
