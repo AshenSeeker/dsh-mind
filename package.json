@@ -1,6 +1,6 @@
 {
   "name": "dsh-mind",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "description": "DeepSeek Harness 心智插件（dsh-mood 的精简 fork）：33 种心情各有数值，每 3~6 小时自动判定，用户消息小幅累积加减分，达到余量才切换，支持混合心情；附带加密心情日记、跨会话可检索的硬盘记忆、跨会话审美品味库、可选的主动开口。各模块可独立开关，数据可迁移到任意盘。",
   "type": "module",
   "main": "index.js",

@@ -284,14 +284,26 @@ const STOP = new Set(['这个', '那个', '什么', '怎么', '可以', '还是'
   '但', '你', '我', '他', '她', '的', '了', '是', '在', '和', '就', '都', '也', '很', '有', '不', '要',
   '把', '给', '对', '到', '会', '能', '得', '着', '这', '那', '吗', '呢', '吧', '啊', '哦', '嗯'])
 
+/**
+ * 高频词里**永远没意义**的那些（2026-11-09 补）。
+ *
+ * ⚠️ 起因：11-08 的素材里 8 个高频词有 6 个是每轮自动贴进来的采样标记 ——
+ *    time / asia / step / turn / preparing / sampled。
+ *    它们不是我俩在聊的东西，是外壳；把它们摊到素材上，
+ *    写日记时就会被它们牵着走，只能写成工时报告。
+ *
+ * 规则很硬：**纯 ASCII 的候选词一律不收。**
+ * 理由是中国人的日常对话里，反复出现的英文单词绝大多数是代码词、
+ * 路径片段、系统标记（`dataFile`、`dsh-mind`、`system-reminder`）。
+ * 真有反复出现的英文内容（比如一整天在聊某个库），
+ * 成文时我自己看得见素材里的原话，不需要靠词频提醒。
+ */
+const ASCII_NOISE = /^[\x00-\x7f]+$/
+
 /** 从一段话里抠出候选词（不做真分词，够看出"今天反复在说什么"就行） */
 export function words(text) {
   const t = String(text || '')
   const out = []
-  for (const m of t.matchAll(/[A-Za-z][A-Za-z0-9_+.#-]{2,}/g)) {
-    const w = m[0].toLowerCase()
-    if (!STOP.has(w) && w.length <= 24) out.push(w)
-  }
   const han = t.match(/[\u4e00-\u9fa5]+/g) || []
   for (const seg of han) {
     for (let n = 2; n <= 4; n++) {
@@ -307,7 +319,8 @@ export function words(text) {
 /** 当天反复出现的词（取前 n 个，按频次） */
 export function topWords(bucket, n = 4) {
   const ws = (bucket && bucket.words) || {}
-  const arr = Object.entries(ws).filter(([, c]) => c >= 2)
+  const arr = Object.entries(ws)
+    .filter(([w, c]) => c >= 2 && w.length >= 2 && !STOP.has(w) && !ASCII_NOISE.test(w))
   // 先按频次；同频时长的优先（长词更有信息量）
   arr.sort((a, b) => b[1] - a[1] || b[0].length - a[0].length || (a[0] < b[0] ? -1 : 1))
   const kept = []
@@ -411,6 +424,24 @@ const INJECTED_BODY_HEADS = [
   '<message source_id=',
   '## 这个工作区以前的对话',
   'Current runtime context.',
+  // ⚠️ **每轮自动贴的时间采样标记**（2026-11-09 补）。
+  //    形如 `Time sampled while preparing turn 6, step 1: 2026-11-08T16:17:…`，
+  //    它挂在用户的 `user/message` 事件上，不是主人打的字。
+  //    实测漏进来的后果：11-08 那天 4 条「真话」里 3 条是它，
+  //    高频词表被 time/asia/step/turn/preparing 这些词占满 ——
+  //    素材于是只剩工时，日记只能写成值班记录。
+  'Time sampled while preparing',
+  'Time sampled while',
+  // ⚠️ **Hindsight 的记忆提醒块**（2026-11-09 补）。
+  //    每轮开头贴一段 `<hindsight_knowledge_refresh>`，实测 3272 字符，
+  //    于是它抢到了「最长的一条」，还往词频里灌了「你自己」「哪一处」这些碎片
+  //    （那些碎片来自它里面引用的提示词原文）。
+  '<hindsight_',
+  // ⚠️ **压缩检查点新格式**（2026-11-09 补）。
+  //    老的拦截规则只认 `This is an automatically generated`，
+  //    但 10-30 之后换成了 `[Compressed conversation section] — 标题` 这种，
+  //    于是又漏了进来，照样抢「最长的一条」。
+  '[Compressed conversation section]',
 ]
 const CHAT_BODY_RE = /<(?:message|msg)\s[^>]*speaker\s*=/
 /** 长到这个份上就不是人打的字了（压缩检查点、贴进来的整份文件…）。
@@ -874,6 +905,16 @@ export function pendingSelfWrite(d, now = new Date(), days = 7) {
  * ⚠️ 只给真的发生过的东西：时刻、条数、心情停留、切换、卡壳、当天原话。
  *    **不给模板稿的句子** —— 那会把我往摘要腔上带，而这正是要避免的。
  *    模板原文要看的话，条目里的 `autoText` 有。
+ *
+ * ⚠️ 2026-11-09 重排过一次，原因是**这个格式本身在诱导写汇报**：
+ *    原来开头连着五行都是「说话 N 条 / 在场 X 小时 / 最密 X 点 / 心情停留 / 出岔子」，
+ *    然后才轮到真话。人看见一摞工时，写出来的就是工时报告 ——
+ *    换谁写都一样。现在的顺序是：
+ *      ① 几句**真话**（这是唯一有"具体发生了什么事"的东西）
+ *      ② 一行压扁的活动量（想引用再引用，不摆出来当大纲）
+ *      ③ 心情与卡壳（只留最短一行）
+ *    并把「最长的一条」整段砍成 24 字 —— 它原来能贴 120 字，
+ *    指的是公告板一样的长文，对写日记没帮助，只会把词频带偏。
  */
 export function renderMaterial(d, key, moodLabel = (id) => id) {
   const b = d.daily[key]
@@ -881,39 +922,38 @@ export function renderMaterial(d, key, moodLabel = (id) => id) {
   if (!b && !e) return ''
   const lines = []
   lines.push('## ' + key + ' 的原始素材')
-  lines.push('（这些是插件当天默默攒下来的，不是结论 —— 写的时候别照着念）')
+  lines.push('（插件当天默默攒的，不是结论。**别照着念**——它只回答"发生了什么"，不回答"我当时什么样"。）')
   lines.push('')
   if (b) {
-    lines.push('- 说话：' + (b.messages || 0) + ' 条 / 我这边 ' + (b.turns || 0) + ' 轮')
-    if (b.firstAt && b.lastAt) {
-      const mins = Math.round((b.lastAt - b.firstAt) / 60000)
-      lines.push('- 在场：' + clock(b.firstAt) + ' → ' + clock(b.lastAt) + '（' +
-        (mins >= 60 ? Math.floor(mins / 60) + ' 小时 ' + (mins % 60) + ' 分' : mins + ' 分钟') + '）')
-    }
-    const busy = busiestHour(b)
-    if (busy && busy.count >= 3) lines.push('- 最密：' + busy.hour + ' 点那阵（' + busy.count + ' 条）')
-    const moodRows = Object.entries(b.moodMs || {}).sort((x, y) => y[1] - x[1]).slice(0, 4)
-    if (moodRows.length) {
-      lines.push('- 心情停留：' + moodRows.map(([id, ms]) => moodLabel(id) + ' ' + hm(ms)).join(' / ') +
-        '（主导 ' + moodLabel(dominantMood(b)) + '）')
-    }
-    const sw = Array.isArray(b.switches) ? b.switches : []
-    if (sw.length) {
-      lines.push('- 心情切换 ' + sw.length + ' 次：' +
-        sw.slice(0, 6).map((s) => clock(s.at) + ' ' + moodLabel(s.from) + '→' + moodLabel(s.to)).join(' / ') +
-        (sw.length > 6 ? ' …' : ''))
-    }
-    if (b.errors) {
-      lines.push('- 出岔子：' + b.errors + ' 次' + (b.stuckMs >= 60000 ? '，最长一次卡了 ' + hm(b.stuckMs) : ''))
-    }
-    const tw = topWords(b, 8)
-    if (tw.length) lines.push('- 反复出现的词：' + tw.map((x) => '「' + x.w + '」×' + x.c).join(' '))
-    const qs = (b.quotes || []).slice()
+    // ① 真话优先。这是素材里唯一带"具体"的东西。
+    const qs = (b.quotes || []).filter((q) => !isInjectedText(q.text)).slice(-4)
     if (qs.length) {
-      lines.push('- 主人当天真说过的话（原话，可以引用，别改写）：')
+      lines.push('- 主人那天真说过的几句（原话，可以引，别改写）：')
       for (const q of qs) lines.push('  · ' + clock(q.at) + ' ' + q.text)
     }
-    if (b.longest && b.longest.text) lines.push('- 最长的一条（' + b.longest.len + ' 字）：' + b.longest.text)
+    // ② 活动量压成一行，不再一行一个指标。
+    const bits = []
+    bits.push('说话 ' + (b.messages || 0) + ' 条 / 我 ' + (b.turns || 0) + ' 轮')
+    if (b.firstAt && b.lastAt) {
+      const mins = Math.round((b.lastAt - b.firstAt) / 60000)
+      bits.push((mins >= 60 ? Math.floor(mins / 60) + ' 小时 ' + (mins % 60) + ' 分' : mins + ' 分钟'))
+    }
+    const busy = busiestHour(b)
+    if (busy && busy.count >= 3) bits.push('最挤 ' + busy.hour + ' 点')
+    if (b.errors) bits.push('卡壳 ' + b.errors + ' 次' + (b.stuckMs >= 60000 ? '（最长 ' + hm(b.stuckMs) + '）' : ''))
+    lines.push('- 量：' + bits.join('｜'))
+    // ③ 心情只留主导 + 时长，切换明细砍掉（写日记用不上第 6 次切换）
+    const moodRows = Object.entries(b.moodMs || {}).sort((x, y) => y[1] - x[1]).slice(0, 2)
+    if (moodRows.length) {
+      lines.push('- 心情：' + moodRows.map(([id, ms]) => moodLabel(id) + ' ' + hm(ms)).join(' / '))
+    }
+    // 反复出现的词：现在只留中文，且最多 5 个
+    const tw = topWords(b, 5)
+    if (tw.length) lines.push('- 反复提到的：「' + tw.map((x) => x.w).join('」「') + '」')
+    if (b.longest && b.longest.len >= 30 && b.longest.text && !isInjectedText(b.longest.text)) {
+      const q = b.longest.text.replace(/\s+/g, ' ').slice(0, 24)
+      lines.push('- 最长的一条（' + b.longest.len + ' 字）：' + q)
+    }
   } else {
     lines.push('- 那天没有素材记录（宿主可能没开）。')
   }
