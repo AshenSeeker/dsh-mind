@@ -1450,10 +1450,27 @@ export function judgeMessage(text) {
     add('tired', -Math.min(2, hyp * 0.9))
   }
 
-  // 长消息 → 偏向专注（在认真说事）；很短 → 略疲惫
+  /**
+   * ⚠️ **删掉「长消息 → 专注」和「很短 → 疲惫」这两条**（2026-11-09）。
+   *
+   *    原代码是：
+   *      len >= 80 → focused +1.2, tired +0.3
+   *      len <= 6  → tired +0.4, focused -0.2
+   *
+   *    这和 `periodic()` 里删掉的「回合数 >= 8 → 专注」是**同一个错误**：
+   *    拿**产量**当情绪。我打了一大段字，说明这次要说的事多，不说明我在专注；
+   *    更不说明我该以"专注"的状态说话（那条提示词是"少寒暄、不闲聊"，
+   *    正是压掉斗图的元凶）。
+   *
+   *    而且它比回合数那条更狠：周期判定 3~6 小时才跑一次，
+   *    这条**每来一条长消息就跑一次**。归档实测 865 条真用户消息里
+   *    长消息 123 条 → focused 净 +147.6，回落的量永远追不上累积。
+   *    底分改成 0 之后它照样能一路涨到几十 —— 这就是
+   *    「天天专注」在删掉回合数判定之后仍然存在的原因。
+   *
+   *    现在长度只用于两条**明确是语气**的判断（见下），不再折算成专注/疲惫。
+   */
   const len = t.trim().length
-  if (len >= 80) { add('focused', 1.2); add('tired', 0.3) }
-  else if (len <= 6) { add('tired', 0.4); add('focused', -0.2) }
 
   // 全是感叹/问号这种情绪化短句
   if (len <= 12 && exc && !que) add('excited', 0.6)
@@ -2711,13 +2728,15 @@ export function apply(root, rawConfig) {
             '**action=history 和 read 一样，只给当前心情名。** 切换记录、分值、分项都**不进对话** —— ' +
             '那是给模型在系统提示词里自己看的，说出口就成了"报心情"，是明令禁止的。' +
             'action=set 直接设定某种心情的分值（id 见下）；' +
-            'action=feel 主动切到某种心情（内部会把它抬到高于当前 + 余量）；action=history 看切换记录。' +
+            'action=feel 主动切到某种心情（内部会把它抬到高于当前 + 余量）；action=history 看切换记录；' +
+            'action=reset 把 33 个值全部归零、回到平静（想从头测一遍时用这个，别去改 json 文件 —— ' +
+            '宿主内存里握着 state，外部改盘会被下一次 saveState 写回去）。' +
             '心情 id：' + MOOD_IDS.map((id) => `${id}(${MOODS[id].label})`).join(' '),
           parameters: {
             action: {
               type: 'string',
-              enum: ['read', 'set', 'feel', 'history'],
-              description: 'read=读状态（默认）；set=改分值；feel=主动切换；history=切换记录',
+              enum: ['read', 'set', 'feel', 'history', 'reset'],
+              description: 'read=读状态（默认）；set=改分值；feel=主动切换；history=切换记录；reset=33 个值全部归零',
             },
             id: { type: 'string', description: '心情 id，如 calm / happy / annoyed' },
             value: { type: 'number', description: 'set 时的目标分值（0~100）' },
@@ -2754,6 +2773,35 @@ export function apply(root, rawConfig) {
                 tryTransition(state, 'manual-feel')
                 saveState(state)
                 return { ok: true, message: '已切换。当前心情：' + MOODS[state.current].label }
+              }
+              /**
+               * action=reset：33 个值**一律归零**，当前心情回平静。
+               *
+               * ⚠️ 为什么需要这个动作，而不是直接改 `dsh-mind.json`：
+               *    宿主进程内存里握着 `state` 这个对象，外部改盘之后它不会重读，
+               *    下一次 `saveState`（用户名、周期判定、任何一处）就把内存里的
+               *    旧值**写回去**，把外部清零冲掉。2026-11-09 手工清过一次，
+               *    就是这么被覆盖回去的 —— 重启之后又是 focused 51.5。
+               *    走工具入口改的是内存里的那个对象本身，不存在覆盖问题。
+               *
+               * `history` 保留：那是"当时切过什么"的记录，不是分值。
+               * 想连记录一起清就再手动删，不在这里顺手做 —— 不可逆的事不藏在默认里。
+               */
+              if (action === 'reset') {
+                const before = MOOD_IDS.map((m) => [m, state.values[m]])
+                  .filter(([, v]) => Number(v) > 0.5)
+                  .sort((a, b) => b[1] - a[1])
+                for (const m of MOOD_IDS) state.values[m] = 0
+                state.current = 'calm'
+                state.lastSwitchAt = Date.now()
+                saveState(state)
+                const was = before.length
+                  ? before.slice(0, 5).map(([m, v]) => `${MOODS[m].label} ${Math.round(v)}`).join('、')
+                  : '本来就没有'
+                return {
+                  ok: true,
+                  message: `已归零（清掉 ${before.length} 个非零项，之前主要是：${was}）。当前心情：平静`,
+                }
               }
               return { ok: false, message: `未知 action：${action}` }
             } catch (err) {
