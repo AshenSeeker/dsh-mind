@@ -69,6 +69,9 @@ import {
   addItem, updateItem, removeItem,
   setSummary, summaryStale, stats as tasteStats,
   renderFull as renderTasteFull, renderForPrompt as renderTaste,
+  // 整库复审（2026-11-21）：staleForReview 判到期，reviewChecklist 摆事实，
+  // applyReview 提交 —— 三件一个动作，拆开做就是假动作。
+  staleForReview, reviewChecklist, applyReview,
 } from './taste.js'
 // 主动开口：默认关。投递走 sessionController.prompt（官方那条路），
 // 投的是"插件提醒"框，不伪造用户的话 —— 说不说由模型自己决定。
@@ -492,6 +495,107 @@ function fmt(o) {
 
 export const MOOD_IDS = Object.keys(MOODS)
 
+/**
+ * 每个心情"没人刺激时剩下多少" —— **底分梯度**（2026-11-21 加）。
+ *
+ * 背景：2026-11-09 把所有 baseline 一次归零，是为了治"面板上永远挂着几条在跑"。
+ * 治过了：33 个值里常年 28~30 个是 0，剩下的最高也就十几 —— 用户的原话是
+ * 「很多种心情都是0，会上涨的也个位数」。
+ *
+ * 两头都不要：全 0 是死的，原版 5~45 的底分是"一直在演"。
+ * 现在这套梯度回答的是另一个问题：**这种情绪在平常日子里本来就该剩多少？**
+ *   · 开心 / 好奇 最高 —— 干活的时候默认就是这两个
+ *   · 专注 / 疲惫 / 烦躁 次之 —— 手上有活、有摩擦
+ *   · 其余 2~3 —— 存在但不显眼
+ *
+ * ⚠️ 数值乘了 SCALE（0.5），所以这里写的是"减半后"的目标值。
+ *    用户的要求原话：「把所有心情降一半就行，总体趋势不变，只是数值降低了」。
+ */
+const BASE_RAW = {
+  calm: 0,
+  happy: 5, curious: 5, focused: 4, tired: 4, annoyed: 4,
+  excited: 3, down: 3, anxious: 3, proud: 3, sympathy: 3, nostalgia: 3, coy: 3, surprise: 3, burnout: 3,
+  sulk: 2, hurt: 2, gloomy: 2, numb: 2, lonely: 2, flutter: 2, love: 2, jealous: 2,
+  cracked: 2, checkedout: 2, hyper: 2, fear: 2, disgust: 2, shame: 2, guilt: 2,
+  awkward: 2, disappointed: 2, conflict: 2,
+}
+
+/**
+ * **数值层整体倍率**（2026-11-21）。
+ *
+ * 用户的原话：「把所有心情降一半就行，总体趋势不变，只是数值降低了，这才叫余温」。
+ *
+ * 所有会进数值比较的东西一起乘它：底分、切换门槛、回落门槛、窗口门槛、
+ * 随机游走幅度、每条加分的实际落值。**必须一起改** —— 只改一半就会改出形状，
+ * 那就不是"降一半"，是"换了一套参数"。
+ */
+const SCALE = 0.5
+
+/** 每个心情的回落目标（= BASE_RAW × SCALE）。没列出来的按 0 算。 */
+const BASE = {}
+for (const id of Object.keys(BASE_RAW)) BASE[id] = BASE_RAW[id] * SCALE
+
+const baselineOf = (id) => (BASE[id] === undefined ? 0 : BASE[id])
+
+/**
+ * **派生：高频心情"带着"低频心情一起出现**（2026-11-21，用户提的）。
+ *
+ * 起因是一份实测：33 张词表在 1098 条真实消息上的命中率，
+ * 有 9 张是 **0 次**（孤单/消沉/心动/恋慕/吃醋/厌恶/内疚/尴尬/撒娇）。
+ * 用户当时说的是：「0命中的那些你不是也给他一个基础浮动保证他不会为零吗，
+ * 这几个零命中的给你刚实测的有百分比的几个心情绑起来，可以多对一，
+ * 给他们分别设置合理的比例，在基础的浮动上叠加计算，形成拟人感」。
+ *
+ * 判断：那些心情不是不存在，是**没有自己的词**。没人说"我厌恶"，
+ * 但说"这太恶心了"的时候，厌烦也一起上来了 —— 它们本来就是跟着别的情绪来的。
+ *
+ * ⚠️ 两条约束：
+ *   1. 比例一律 < 0.40 —— 派生永远不该盖过主情绪，它只是让背景里那二十几个不是死的。
+ *   2. **只算一层，不递归** —— 否则一次烦躁能滚出一整圈（烦躁→委屈→破防→羞耻→…）。
+ */
+const DERIVE = {
+  annoyed:  { disgust: 0.30, conflict: 0.24, hurt: 0.20, shame: 0.16 },
+  down:     { disappointed: 0.40, gloomy: 0.38, sympathy: 0.26, nostalgia: 0.22 },
+  tired:    { burnout: 0.20, checkedout: 0.26, numb: 0.24, gloomy: 0.22 },
+  anxious:  { fear: 0.36, conflict: 0.30, guilt: 0.22 },
+  sulk:     { hurt: 0.34, awkward: 0.22 },
+  hurt:     { cracked: 0.32, sulk: 0.30, shame: 0.22 },
+  excited:  { hyper: 0.38, surprise: 0.36 },
+  happy:    { flutter: 0.30, proud: 0.30, coy: 0.26 },
+  curious:  { surprise: 0.30, hyper: 0.24 },
+  proud:    { coy: 0.28 },
+  love:     { flutter: 0.40, coy: 0.34, jealous: 0.32 },
+  lonely:   { gloomy: 0.34, nostalgia: 0.30, sympathy: 0.20 },
+  shame:    { awkward: 0.36, guilt: 0.30 },
+  awkward:  { shame: 0.26 },
+  sympathy: { down: 0.22 },
+  flutter:  { coy: 0.30 },
+}
+
+/**
+ * **思考链词表**（2026-11-21）。
+ *
+ * 起因：用户说「得在底层机制上改了，把你思考链里触发的关键词也加进去试试看」。
+ * 动机很实在 —— 33 张词表里 `focused`（专注）唯一正源是"上头/入迷/来劲"这四个词，
+ * 四天里命中 2 次，等于永远不可能出现。而"我在想事情"这件事，
+ * 用户消息里看不出来，思考链里全都是。
+ *
+ * ⚠️ **通用词一律不收**。第一版试过 `hmm / maybe / actually / wait / failed`，
+ *    在 1429 个思考块上实测：hmm 出现 2057 次、maybe 1637 次 —— 每块都中，
+ *    等于把 11-09 删掉的 `noise: 3` 又请回来了。只留指向"我自己卡住了/通了"的短语。
+ */
+const THINK_STUCK = [
+  'let me reconsider', 'let me re-read', 'let me step back', 'i was wrong', 'my mistake',
+  "that's not right", 'no, that', 'nope', 'still broken', 'fails again',
+  '换个思路', '我搞错了', '让我重新', '我得重新',
+]
+const THINK_UGH = ['ugh', 'annoying', 'frustrating', 'why is it', 'why does it', '好烦', '真烦']
+const THINK_FOUND = [
+  'found it', 'works now', 'now it works', 'that explains', "so that's why",
+  'makes sense', 'now i understand', 'got it working', '解决了', '找到了',
+]
+const THINK_UNSURE = ['not sure', 'unclear', 'ambiguous', "i don't know", 'not certain', '说不好', '不确定']
+
 /** 痛苦信号的有效窗口：从命中起这段时间内暂停情绪表演 */
 export const DISTRESS_WINDOW_MS = 30 * 60 * 1000
 
@@ -535,8 +639,13 @@ export const REALITY_GUARD = [
 // ---------------------------------------------------------------- 调参
 
 const CFG = {
-  /** 候选心情要超出当前多少分才允许切换 */
-  margin: 5,
+  /**
+   * 候选心情要超出当前多少分才允许切换。
+   *
+   * ⚠️ 0.5 是 SCALE 乘过的结果（原值 6）—— 数值层整体减半之后，
+   *    门槛不跟着减半就等于把门槛抬高了一倍，切换会突然变少。
+   */
+  margin: 6 * SCALE,
   /**
    * 当前心情的分掉到这个值以下 → 直接回「平静」（2026-11-09）。
    *
@@ -545,14 +654,26 @@ const CFG = {
    *    心情就会卡在最后一次被推上去的那个 —— 面板显示"烦躁"，
    *    实际全是 0。这是"底分清零"这件事只做了一半才有的死角。
    */
-  resetBelow: 1.5,
+  resetBelow: 1.5 * SCALE,
   /** 两次切换之间的最短间隔（毫秒），防抖 */
-  minHoldMs: 15 * 60 * 1000,
-  /** 周期判定的随机区间：3~6 小时 */
-  periodMinMs: 3 * 60 * 60 * 1000,
-  periodMaxMs: 6 * 60 * 60 * 1000,
-  /** 周期判定时向基线回落的比例 */
-  decayRatio: 0.35,
+  minHoldMs: 8 * 60 * 1000,
+  /**
+   * 周期判定的随机区间：1.5~3 小时（2026-11-21 从 3~6 小时改短）。
+   *
+   * 原因：回落一次是 `值 × (1 - 0.12)`，间隔越长每一轮掉得越狠，
+   * 白天会出现"攒起来 → 隔四小时掉一半"的锯齿。判定密一点、每步小一点，
+   * 曲线才像流动而不是跳变。
+   */
+  periodMinMs: 1.5 * 60 * 60 * 1000,
+  periodMaxMs: 3 * 60 * 60 * 1000,
+  /**
+   * 周期判定时向基线回落的比例。
+   *
+   * ⚠️ 0.35 → 0.12（2026-11-21）。0.35 配 3~6 小时是"每次判定砍掉三分之一"，
+   *    攒起来的值撑不到下一次判定就归零，所以图上永远是尖峰。
+   *    判断间隔同时缩短到 1.5~3 小时，两步合起来才是"缓慢回落"的样子。
+   */
+  decayRatio: 0.12,
   /**
    * 正向心情的回落速度倍率 —— **比负向慢一半**（2026-11-09）。
    *
@@ -560,8 +681,6 @@ const CFG = {
    *
    * 理由：坏情绪自己会走，好情绪不会自己回来。如果两者衰减一样快，
    * 结果就是负向在面板上停留的时间天然比正向长 —— 那不是"真实"，那是算法偏心。
-   * 折半之后一次周期判定（3~6 小时）里，负向剩 65%、正向剩 82.5%，
-   * 正向大约多存活一个周期。
    *
    * ⚠️ 这个倍率**只作用于 `MOODS[id].pos === true` 的那几条**，
    *    而且只在 `decayValues` 用默认 ratio 时生效 —— 显式传 `opts.ratio`
@@ -582,6 +701,51 @@ const CFG = {
    *    没被消息、没被周期里的真实事件推到，就老老实实是 0。
    */
   noise: 0,
+  /**
+   * 低位的微小游走幅度（2026-11-21，用户要求"每个心情都有起伏不为零"）。
+   *
+   * ⚠️ 和上面的 `noise` 不是一回事，别混：
+   *    `noise`  每轮给**全部 33 个**加减 ±3，而且不管当前值多少 → 那是纯噪声。
+   *    这一项**只给低位（< 12 × SCALE）的值**加 ±drift × SCALE，
+   *    目的是让那些底分只有 2~3 的心情有呼吸，高位不动 —— 高位由真实事件管。
+   */
+  drift: 1.0 * SCALE,
+  /** drift 的作用上限：值超过这个就不再抖（避免把真实的高分搅乱） */
+  driftBelow: 12 * SCALE,
+  /** 每条心情每天的加分总预算（三通道共用），到顶当天不再加 */
+  dailyCap: 30,
+  /**
+   * 标签层窗口：最近多久内拿到的加分决定"现在算什么心情"。
+   *
+   * ⚠️ 这是 2026-11-21 最重要的一处结构性改动 —— **数值层与标签层分开**。
+   *
+   *    原来 `tryTransition` 问的是"现在哪个值最高"，而那等于问
+   *    "哪个心情被喂得最频繁"。专注被每个深思考回合喂一次，
+   *    于是它 19 个小时不下班；好奇被每个问句喂一次，于是它 96%。
+   *    这和"最近发生了什么"没关系，所以显得不像人。
+   *
+   *    现在改成：**最近 20 分钟内拿到最多新分的是哪个**，没有就是平静。
+   *    值该攒还是攒（图上看得见），但标签只反映"刚刚"。
+   */
+  winMs: 20 * 60 * 1000,
+  /** 窗口内的分低于这个值就当没发生 → 平静 */
+  winMin: 0.4 * SCALE,
+  /** 稀疏时把窗口放宽到一小时（一小时内不足 winSparseN 条加分事件算稀疏） */
+  winSparseMs: 60 * 60 * 1000,
+  winSparseN: 3,
+  /** 余温门槛：当前心情还高于这个值就先不退，给"情绪慢慢过去"留余地 */
+  holdWarm: 3 * SCALE,
+  /**
+   * 静默降温：安静下来就把所有值乘 coolFactor，一天最多一次。
+   *
+   * 用户的原话：「把所有心情降一半就行，总体趋势不变，只是数值降低了，这才叫余温」，
+   * 以及「要把乙这个方案写成 24 小时内最多触发一次，不然一直 ×0.5 怎么行」。
+   */
+  coolAfterMs: 90 * 60 * 1000,
+  coolEveryMs: 24 * 60 * 60 * 1000,
+  coolFactor: 0.5,
+  /** 当前心情多久没被新证据喂过 → 回平静（情绪会过去） */
+  ttlMs: 180 * 60 * 1000,
   /** 历史最多保留多少条 */
   historyMax: 60,
   /**
@@ -936,6 +1100,12 @@ function blankState() {
     toolErrors: 0,
     updatedAt: Date.now(),
     history: [],
+    // 2026-11-21 新增：窗口标签的账本、每条心情最近被喂的时间、上次降温时间、
+    // 以及"今天每条心情已经加了多少分"的每日预算。
+    recent: [],
+    lastFed: {},
+    lastCoolAt: 0,
+    pool: { day: '', used: {} },
   }
 }
 
@@ -961,19 +1131,114 @@ function clamp(v) {
 function decayValues(values, opts = {}) {
   const explicit = opts.ratio !== undefined
   const noise = opts.noise === undefined ? 0 : opts.noise
+  const drift = opts.drift === undefined ? 0 : opts.drift
   const rand = opts.rand || Math.random
   const out = {}
   for (const id of MOOD_IDS) {
-    const base = MOODS[id].baseline
+    // ⚠️ 底分不读 MOODS[id].baseline 了 —— 那张表里全是 0（2026-11-09 的结论）。
+    //    2026-11-21 起底分单独放在 BASE（保留了"各情绪平常剩多少"的梯度）。
+    const base = baselineOf(id)
     const cur = Number(values && values[id]) || 0
     // 正向心情落得慢一半（CFG.positiveDecayFactor）。显式传 ratio 时不折半 ——
     // 那是测试路径，要保持"同一个 ratio 就是同一个结果"的可预测性。
     const ratio = explicit
       ? opts.ratio
       : CFG.decayRatio * (MOODS[id].pos === true ? CFG.positiveDecayFactor : 1)
-    out[id] = clamp(cur + (base - cur) * ratio + (rand() * 2 - 1) * noise)
+    // 低位微抖：只给"还没被真实事件推起来"的值加一点呼吸，高位的数值不许搅。
+    // 这是用户要的"每个心情都有起伏不为零"，和 11-09 删掉的 noise 不是一回事 ——
+    // noise 是给全部 33 个钱包都撒钱，这个是只让贴底的轻轻晃。
+    const wobble = drift > 0 && cur < CFG.driftBelow ? (rand() * 2 - 1) * drift : 0
+    out[id] = clamp(cur + (base - cur) * ratio + (rand() * 2 - 1) * noise + wobble)
   }
   return out
+}
+
+/**
+ * 派生：把这一拍拿到的加分，按 DERIVE 的比例分一点给"跟着它来的"那些心情。
+ *
+ * ⚠️ **只算一层，不递归**。递归的话烦躁→委屈→破防→羞耻→尴尬会连锁滚一圈，
+ *    一次小摩擦半小时后能攒出七八种情绪，那比不派生更假。
+ */
+function deriveChanges(changes) {
+  const born = {}
+  for (const [p, v] of Object.entries(changes)) {
+    if (typeof v !== 'number' || v <= 0) continue
+    const kids = DERIVE[p]
+    if (!kids) continue
+    for (const [c, r] of Object.entries(kids)) {
+      if (!MOODS[c]) continue
+      born[c] = (born[c] || 0) + v * r
+    }
+  }
+  return born
+}
+
+/**
+ * 每天每条心情的加分预算。
+ *
+ * ⚠️ 为什么同一个心情要一个**跨通道共用**的预算，而不是每通道各一份：
+ *    分开配的时候烦躁能同时吃"用户消息"和"思考链"和"工具报错"三份配额，
+ *    实测一天冲过 55 分（而设计目标是 30）。预算必须做成单一的。
+ *
+ * 负分不占预算 —— 压下去不需要配额，那是往回拉，不是加油。
+ */
+function dailyPool(state, now) {
+  const day = dateKey(new Date(now))
+  if (!state.pool || state.pool.day !== day) state.pool = { day, used: {} }
+  if (!state.pool.used) state.pool.used = {}
+  return state.pool
+}
+
+/** 按每日预算记一笔加分，返回实际生效的增量（预算用完就是 0） */
+function addScored(state, id, delta, now) {
+  if (!MOODS[id] || typeof delta !== 'number' || delta === 0) return 0
+  if (delta < 0) return delta
+  const pool = dailyPool(state, now)
+  const used = pool.used[id] || 0
+  if (used >= CFG.dailyCap) return 0
+  const real = Math.min(delta, CFG.dailyCap - used)
+  pool.used[id] = used + real
+  return real
+}
+
+/**
+ * 把一条消息里的**思考链**文本抠出来。
+ *
+ * ⚠️ 这是 2026-11-21 新增的第四条输入通道，用户的原话是
+ *    「得在底层机制上改了，把你思考链里触发的关键词也加进去试试看」。
+ *
+ * 为什么值得单独做一条：33 张词表里 `focused`（专注）唯一的正源是
+ * "上头/入迷/来劲"这四个词，四天实测命中 2 次 —— 等于永远出不来。
+ * 而"我在想事情、我卡住了、我想通了"这件事，用户消息里看不出来，
+ * 思考链里全都是。不接这条，专注就永远只能靠补丁（而补丁已经被删过一次了）。
+ *
+ * ⚠️ 但**不能按块判**：思考块的数量是用户消息的 16 倍（实测 2375 : 151）。
+ *    逐块加分的结果是 `annoyed` 直接顶到 100、11-19 全天 100% 显示烦躁。
+ *    所以必须先在 `ThinkBuf` 里按**回合**聚合，再由 `flushThink` 一次结算。
+ */
+function extractReasoning(data) {
+  if (!data || typeof data !== 'object') return ''
+  const node = (data.message && typeof data.message === 'object') ? data.message : data
+  const blocks = node && Array.isArray(node.content) ? node.content : null
+  if (!blocks) return ''
+  const out = []
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue
+    if (b.type !== 'reasoning') continue
+    const t = typeof b.text === 'string' ? b.text : (typeof b.value === 'string' ? b.value : '')
+    if (t.trim()) out.push(t)
+  }
+  return out.join('\n')
+}
+
+/** 数一张思考链词表在这段文本里命中了几次（小写化后再找） */
+function countThink(text, words) {
+  let n = 0
+  for (const w of words) {
+    let i = 0
+    while ((i = text.indexOf(w, i)) >= 0) { n++; i += w.length }
+  }
+  return n
 }
 
 function loadState() {
@@ -982,6 +1247,13 @@ function loadState() {
     const s = Object.assign(blankState(), raw)
     s.values = Object.assign(freshValues(), raw && raw.values)
     for (const id of MOOD_IDS) s.values[id] = clamp(s.values[id])
+    // 2026-11-21 新增字段的老存档兼容：缺的补上，形状不对的一律重置成空
+    if (!Array.isArray(s.recent)) s.recent = []
+    else s.recent = s.recent.filter((r) => r && typeof r.t === 'number' && MOODS[r.m] && r.d > 0)
+    if (!s.lastFed || typeof s.lastFed !== 'object') s.lastFed = {}
+    if (typeof s.lastCoolAt !== 'number') s.lastCoolAt = 0
+    if (!s.pool || typeof s.pool !== 'object') s.pool = { day: '', used: {} }
+    if (!s.pool.used || typeof s.pool.used !== 'object') s.pool.used = {}
     if (!MOODS[s.current]) s.current = argmax(s.values)
     return s
   } catch {
@@ -1073,12 +1345,87 @@ function aroundOf(diary, lastText, now = Date.now()) {
 }
 
 /**
- * 尝试切换。只有候选值 >= 当前值 + margin，且过了 minHold 才真的切。
+ * 窗口标签用的小账本：谁在什么时候拿到了多少新分。
+ *
+ * 存进 state 而不是内存闭包 —— 重启之后"最近二十分钟发生过什么"仍然是有意义的信息，
+ * 丢掉它会让重启那一刻的标签莫名变成平静。
+ */
+function pushRecent(state, changes, now) {
+  if (!Array.isArray(state.recent)) state.recent = []
+  for (const [m, v] of Object.entries(changes)) {
+    if (!MOODS[m] || typeof v !== 'number' || v <= 0) continue
+    state.recent.push({ t: now, m, d: v })
+  }
+  // 只留一小时（稀疏窗口的上限），多的一律丢
+  const cut = now - CFG.winSparseMs
+  let i = 0
+  while (i < state.recent.length && state.recent[i].t < cut) i++
+  if (i > 0) state.recent = state.recent.slice(i)
+}
+
+/** 最近 winMs 内有多少条加分事件（判断是不是"稀疏"） */
+function recentCount(state, now) {
+  const arr = state.recent || []
+  let n = 0
+  for (let i = arr.length - 1; i >= 0; i--) {
+    if (now - arr[i].t > CFG.winMs) break
+    n++
+  }
+  return n
+}
+
+/**
+ * **标签层**：最近窗口里谁拿到的分最多。
+ *
+ * 这是 2026-11-21 那处结构性改动的落点：数值层回答"攒了多少"，
+ * 标签层回答"刚刚发生了什么"。两者分开之后，被喂得很频繁的心情
+ * 才不会再十几小时不下班。
+ *
+ * 返回 { mood, score, sparse } —— mood 为 null 表示窗口里什么都没有（该显示平静）。
+ */
+function windowLabel(state, now) {
+  const arr = state.recent || []
+  const sparse = recentCount(state, now) < CFG.winSparseN
+  const span = sparse ? CFG.winSparseMs : CFG.winMs
+  const sums = {}
+  for (const r of arr) {
+    if (now - r.t > span) continue
+    sums[r.m] = (sums[r.m] || 0) + r.d
+  }
+  let best = null
+  let bs = 0
+  for (const [m, v] of Object.entries(sums)) {
+    if (v > bs) { bs = v; best = m }
+  }
+  return { mood: best, score: bs, sparse }
+}
+
+/**
+ * 尝试切换。两种判据并行：
+ *   · 当前心情掉到 resetBelow 以下 → 回平静（值走空了）
+ *   · 当前心情超过 ttlMs 没被新证据喂过 → 回平静（情绪会过去）
+ *   · 否则按**最近窗口**里谁拿到的分最多来定，且要比当前心情高 margin 才切
  * 返回 {switched, from, to} —— 没切也返回候选，便于观察"正在逼近"。
  */
 function tryTransition(state, reason, now = Date.now(), around = null) {
-  const candidate = argmax(state.values)
   const from = state.current
+
+  /**
+   * ⚠️ **静默降温**（2026-11-21，用户要求的一天最多一次）。
+   *
+   *    用户原话：「把所有心情降一半就行，总体趋势不变，只是数值降低了，这才叫余温」，
+   *    以及「要把乙这个方案写成 24 小时内最多触发一次，不然一直 ×0.5 怎么行」。
+   *
+   *    判据是"安静下来了"：多久没有新的加分事件。到点就整体乘 coolFactor，
+   *    形状不变（所有值等比缩），所以曲线看起来只是"凉下去"，不是变形。
+   */
+  const lastBump = (state.recent && state.recent.length) ? state.recent[state.recent.length - 1].t : 0
+  if (lastBump && now - lastBump >= CFG.coolAfterMs &&
+      now - (state.lastCoolAt || 0) >= CFG.coolEveryMs) {
+    for (const id of MOOD_IDS) state.values[id] = clamp((Number(state.values[id]) || 0) * CFG.coolFactor)
+    state.lastCoolAt = now
+  }
+
   /**
    * ⚠️ **回落归零**（2026-11-09 加）。
    *
@@ -1105,19 +1452,69 @@ function tryTransition(state, reason, now = Date.now(), around = null) {
       ...(around ? { around } : {}),
     })
     if (state.history.length > CFG.historyMax) state.history = state.history.slice(-CFG.historyMax)
-    return { switched: true, from, to: 'calm', candidate, reset: true }
+    return { switched: true, from, to: 'calm', candidate: from, reset: true }
   }
-  if (candidate === from) return { switched: false, from, to: from, candidate }
-  const enough = state.values[candidate] >= state.values[from] + CFG.margin
-  const held = now - (state.lastSwitchAt || 0) >= CFG.minHoldMs
-  if (!enough || !held) return { switched: false, from, to: from, candidate, enough, held }
-  state.current = candidate
+
+  /**
+   * TTL：当前心情太久没被新证据喂过 → 回平静。
+   *
+   * ⚠️ 这一条是"心情一直不下来"的另一个出口。只看数值高低不够 ——
+   *    值高只说明攒得多，不代表刚刚还在发生。
+   */
+  if (from !== 'calm') {
+    const fed = state.lastFed && state.lastFed[from] ? state.lastFed[from] : 0
+    if (fed && now - fed > CFG.ttlMs) {
+      state.current = 'calm'
+      state.lastSwitchAt = now
+      state.history.push({
+        at: now, from, to: 'calm', reason: (reason || '') + '/ttl',
+        values: Object.assign({}, state.values),
+        ...(around ? { around } : {}),
+      })
+      if (state.history.length > CFG.historyMax) state.history = state.history.slice(-CFG.historyMax)
+      return { switched: true, from, to: 'calm', candidate: from, ttl: true }
+    }
+  }
+
+  if (now - (state.lastSwitchAt || 0) < CFG.minHoldMs) return { switched: false, from, to: from }
+
+  // 标签层：最近窗口里谁拿到的分最多
+  const w = windowLabel(state, now)
+  const best = w.mood
+  const bs = w.score
+
+  // 余温：窗口里没东西了，但当前这个还热着 → 再站一会儿，别一到点就翻脸
+  if (!best || bs < CFG.winMin) {
+    if (from !== 'calm' && (Number(state.values[from]) || 0) >= CFG.holdWarm) {
+      return { switched: false, from, to: from, holdWarm: true }
+    }
+    if (from === 'calm') return { switched: false, from, to: from }
+    const target = 'calm'
+    state.current = target
+    state.lastSwitchAt = now
+    state.history.push({
+      at: now, from, to: target, reason: (reason || '') + '/win-none',
+      values: Object.assign({}, state.values),
+      ...(around ? { around } : {}),
+    })
+    if (state.history.length > CFG.historyMax) state.history = state.history.slice(-CFG.historyMax)
+    return { switched: true, from, to: target }
+  }
+
+  if (best === from) return { switched: false, from, to: from, candidate: best }
+
+  // ⚠️ 这里**不要**再加"领先多少才切"的门槛（2026-11-21 试过，撤了）。
+  //    窗口标签问的是"最近二十分钟里谁拿到的分最多"，本来就带了时间窗；
+  //    再叠一个 margin，结果是绝大部分时间都判不切换 ——
+  //    实测三天：加门槛 10 次切换 / 平静 83%，去掉 89 次切换 / 平静 45%。
+  //    用户看过并认可的是后者（有起伏、标签会变），前者等于又退回"一直平静"。
+  state.current = best
   state.lastSwitchAt = now
   state.history.push({
     at: now,
     from,
-    to: candidate,
-    reason,
+    to: best,
+    reason: (reason || '') + (w.sparse ? '/win-sparse' : '/win'),
     values: Object.assign({}, state.values),
     // ★ 当时在干什么（事实，不是因果）。没有就不写这个字段。
     ...(around ? { around } : {}),
@@ -1127,7 +1524,7 @@ function tryTransition(state, reason, now = Date.now(), around = null) {
   //    一直涨到进程重启为止。实测跑 200 次切换，history 就是 200 条（上限写的是 60）。
   //    每条的 values 是 33 个数字的快照，不裁就是实打实的内存和落盘体积。
   if (state.history.length > CFG.historyMax) state.history = state.history.slice(-CFG.historyMax)
-  return { switched: true, from, to: candidate, candidate }
+  return { switched: true, from, to: best, candidate: best }
 }
 
 // ---------------------------------------------------------------- 判定：用户消息
@@ -1739,13 +2136,100 @@ export function apply(root, rawConfig) {
 
   const emit = (changes, reason, now = Date.now(), lastText = '') => {
     const before = state.current
-    for (const [id, v] of Object.entries(changes)) bump(state, id, v)
+    // 1) 直接情绪：过每日预算（负分不占预算），再乘 SCALE 落到数值层
+    const applied = {}
+    for (const [id, v] of Object.entries(changes)) {
+      if (!MOODS[id] || typeof v !== 'number' || v === 0) continue
+      const real = addScored(state, id, Math.abs(v), now) * (v > 0 ? 1 : -1)
+      if (real === 0) continue
+      applied[id] = real * SCALE
+    }
+    // 2) 派生：跟着主情绪一起上来的那些（只算一层，不递归）
+    const born = deriveChanges(applied)
+    for (const [c, v] of Object.entries(born)) {
+      const real = addScored(state, c, v, now)
+      if (real > 0) applied[c] = (applied[c] || 0) + real * SCALE
+    }
+    for (const [id, v] of Object.entries(applied)) bump(state, id, v)
+    // 3) 记进窗口账本 + 刷新"最近被喂"的时间戳（标签层和 TTL 都靠它）
+    pushRecent(state, applied, now)
+    if (!state.lastFed) state.lastFed = {}
+    for (const id of Object.keys(applied)) state.lastFed[id] = now
     const res = tryTransition(state, reason, now, aroundOf(diary, lastText, now))
     noteMood(diary, state.current, now)
     if (res.switched) noteSwitch(diary, before, res.to, now)
     saveState(state)
     saveDiary(diary)
     return res
+  }
+
+  /**
+   * 思考链的**回合缓冲**。
+   *
+   * 为什么要有这层：思考块太密（实测 2375 块 vs 151 条用户消息 = 16:1）。
+   * 每块都结算的话，烦躁会直接顶到 100，11-19 全天 100% 显示烦躁，
+   * 别的全被盖掉 —— 那样等于没做。
+   *
+   * 所以按"回合"聚合：相邻两个思考块间隔超过 90 秒 → 上一个回合结束、先结算，
+   * 再开新的一回合。一个回合攒够 10 块、或者正文超过 8000 字，
+   * 就算"深思考"（`isDeep`）—— 这是"专注"唯一真实的来源。
+   */
+  const THINK_GAP_MS = 90 * 1000
+  const THINK_DEEP_BLOCKS = 10
+  const THINK_DEEP_CHARS = 8000
+  let thinkBuf = { at: 0, n: 0, chars: 0, text: '' }
+
+  /**
+   * 把攒下的一个思考回合结算成心情分数。
+   *
+   * ⚠️ 词表**只收"我自己状态"的短语**，不收泛用词。
+   *    实测泛用词在 1429 个块里：`hmm` 2057 次、`maybe` 1637 次、`actually,` 542 次 ——
+   *    按关键词加分等于每块都推一次，和 11-09 删掉的 `noise: 3` 是同一种错。
+   *
+   * 四张表各自指向一种真实状态：
+   *   STUCK  = 我卡住了、我搞错了 → 烦躁（外加一点内耗）
+   *   UGH    = 这玩意儿真烦 → 烦躁 + 疲惫
+   *   FOUND  = 通了、找到原因了 → 得意 + 开心
+   *   UNSURE = 我不确定 → 焦虑
+   * 深思考本身 → 专注。**专注没有别的来源了**（"回合数≥8"那条已被删）。
+   */
+  const flushThink = (now = Date.now()) => {
+    if (!thinkBuf.n) return null
+    const b = thinkBuf
+    thinkBuf = { at: 0, n: 0, chars: 0, text: '' }
+    const low = b.text.toLowerCase()
+    const stuck = countThink(low, THINK_STUCK)
+    const ugh = countThink(low, THINK_UGH)
+    const found = countThink(low, THINK_FOUND)
+    const unsure = countThink(low, THINK_UNSURE)
+    const deep = b.n >= THINK_DEEP_BLOCKS || b.chars >= THINK_DEEP_CHARS
+    const changes = {}
+    const addc = (k, v) => { changes[k] = (changes[k] || 0) + v }
+    if (deep) addc('focused', 1.0)
+    if (stuck) { addc('annoyed', 0.3 * Math.min(3, stuck)); addc('burnout', 0.35 * Math.min(2, stuck)) }
+    if (ugh) { addc('annoyed', 0.25 * Math.min(3, ugh)); addc('tired', 0.2 * Math.min(2, ugh)) }
+    if (found) { addc('proud', 0.6 * Math.min(3, found)); addc('happy', 0.3 * Math.min(2, found)) }
+    if (unsure) addc('anxious', 0.4 * Math.min(2, unsure))
+    if (!Object.keys(changes).length) return null
+    return emit(changes, 'thinking', now, '')
+  }
+
+  /**
+   * 收到一个思考块：攒进回合；跨回合就先把上一段结算掉。
+   * `at` 用块自己的时间戳，不是 `Date.now()` —— 批量到达时后者会把时间挤在一起。
+   */
+  const feedThink = (text, at) => {
+    if (!text) return null
+    const now = Number(at) || Date.now()
+    let ended = null
+    if (thinkBuf.n && now - thinkBuf.at > THINK_GAP_MS) ended = flushThink(thinkBuf.at)
+    if (!thinkBuf.n) thinkBuf.at = now
+    thinkBuf.n += 1
+    thinkBuf.chars += text.length
+    // 只留前 20000 字做匹配 —— 一个回合再长，关键词也早在前半段出现过了，
+    // 全文拼起来会让 indexOf 做无用功。
+    if (thinkBuf.text.length < 20000) thinkBuf.text += '\n' + text
+    return ended
   }
 
   /**
@@ -1770,10 +2254,19 @@ export function apply(root, rawConfig) {
     const idle = now - lastUserAtMs
     if (idle < CFG.lonelyIdleMs) return 0
     const overHours = (idle - CFG.lonelyIdleMs) / 3600000
-    const want = CFG.lonelyPerHour * overHours
+    // 2026-11-21：孤单也过每日预算和 SCALE —— 不这样做的话它会在整体减半的
+    // 数值层里独自保持原尺寸，变成最突出的一条。
+    const wantRaw = Math.min(CFG.lonelyPerHour * overHours, CFG.lonelyCap)
+    const got = addScored(state, 'lonely', wantRaw, now)
+    if (got <= 0) return 0
     const cur = Number(state.values.lonely) || 0
-    if (cur >= CFG.lonelyCap) return 0
-    return bump(state, 'lonely', Math.min(want, CFG.lonelyCap - cur))
+    const add = Math.min(got * SCALE, CFG.lonelyCap * SCALE - cur)
+    if (add <= 0) return 0
+    bump(state, 'lonely', add)
+    pushRecent(state, { lonely: add }, now)
+    if (!state.lastFed) state.lastFed = {}
+    state.lastFed.lonely = now
+    return add
   }
 
   /** 周期判定：只是回落 + 真实的空闲/出错 / 不再按工作量造情绪 */
@@ -1781,7 +2274,7 @@ export function apply(root, rawConfig) {
     const st = state
     const activity = { turns: st.turns, errors: st.toolErrors }
     // 回落数学在 decayValues 里（纯函数，可测）—— 这里只负责"什么时候用、用完再叠加什么"
-    Object.assign(st.values, decayValues(st.values, { noise: CFG.noise }))
+    Object.assign(st.values, decayValues(st.values, { noise: CFG.noise, drift: CFG.drift }))
     /**
      * ⚠️ **删掉"干活多→专注/疲惫"这条**（2026-11-09）。
      *
@@ -1798,7 +2291,11 @@ export function apply(root, rawConfig) {
      *    对方说了什么（judgeMessage）、对方多久没说话（noteIdle）、工具真出错。
      */
     // 工具连续报错 → 烦躁。这个留着：它是真事件，不是统计量。
-    if (activity.errors >= 3) { bump(st, 'annoyed', Math.min(4, activity.errors)); bump(st, 'calm', -2) }
+    // 2026-11-21：走每日预算 + SCALE，和别的通道用同一套落值方式。
+    if (activity.errors >= 3) {
+      const a = addScored(st, 'annoyed', Math.min(4, activity.errors), now)
+      if (a > 0) { bump(st, 'annoyed', a * SCALE); bump(st, 'calm', -2 * SCALE) }
+    }
     // ⚠️ 孤单放在**回落之后**：先归零再按空闲时长加，
     //    顺序反了的话这半小时的加分会被同一拍的回落吃掉一部分。
     const lonelyAdd = noteIdle(now)
@@ -2209,6 +2706,25 @@ export function apply(root, rawConfig) {
               }
             } catch { /* 归档失败不能影响对话 */ }
           }
+          /**
+           * 思考链 → 心情（2026-11-21 新增的第四条输入通道）。
+           *
+           * ⚠️ 只喂给心情，**不归档** —— 思考链是过程不是对话，
+           *    存进记忆库会把检索结果淹掉（它比正文多 16 倍）。
+           *    所以走 `extractReasoning` 单独抠，不走 `extractText`。
+           */
+          if (type === 'assistant/message' && moodOn) {
+            try {
+              const think = extractReasoning(d)
+              if (think) {
+                // ⚠️ 事件时间字段是 **`time`**（实测 `{type,seq,time,data,surfaceOp}`），
+                //    没有 `at` 也没有 `ts` —— 只读那两个会一路掉到 Date.now()，
+                //    把"按 90 秒切回合"变成"按处理顺序切"，沉淀一会儿的事件全会糊成一坨。
+                const when = Number(event.time || event.at || event.ts || 0) || Date.now()
+                feedThink(think, when)
+              }
+            } catch { /* 思考链读失败不影响别的 */ }
+          }
           // ── 主动开口用到的三个观察点 ──
           if (session) { liveSession = session; liveSessionRef = session }
           if (type === 'user/message') {
@@ -2264,6 +2780,9 @@ export function apply(root, rawConfig) {
             turnBusy = true
           } else if (type === 'turn/end') {
             turnBusy = false
+            // 一轮结束了，思考链这一回合就在这里结账 ——
+            // 否则要等下一轮的第一个思考块进来才 flush，而那可能是几个小时之后。
+            if (moodOn) { try { flushThink(Number(event.time || 0) || Date.now()) } catch { /* 不影响别的 */ } }
           }
           if (type === 'user/message') {
             const text = extractText(d)
@@ -2301,6 +2820,8 @@ export function apply(root, rawConfig) {
           if (type === 'turn/end') {
             state.turns += 1
             noteActivity(diary, 'turn')
+            // 回合结束了 → 把还没结算的思考链收尾（它是这一回合做的最后一件事）
+            if (moodOn) { try { flushThink(Date.now()) } catch { /* 不管 */ } }
             // 回合刚结束（= 一次任务干完了）。
             // 先看有没有欠着的重启汇报 —— 它**不等空闲**，等了下一次重启就白等了；
             // 再按常规看一眼要不要开口。
@@ -2999,18 +3520,22 @@ export function apply(root, rawConfig) {
             '品味库 —— 跨会话的审美档案。**它已经每轮注入你的提示词了**，' +
             '这个工具是用来**改它**的，不是用来读它的。\n' +
             'action=list 看全库；action=rule 加一条原则/规则；action=add 加一个带正反例的条目；\n' +
-            'action=edit 改；action=confirm 确认一条我打的标；action=remove 删；action=summarize 写摘要。\n' +
+            'action=edit 改；action=confirm 确认一条我打的标；action=remove 删；action=summarize 写摘要；\n' +
+            'action=review 整库复审（看清单 → 改/删 → 重压摘要 → 刷复审时间）。\n' +
             '⚠️ **谁说的要标清楚**：by=owner（主人亲口）/ other（主人认可的外来判断，比如 Claude 说的）/ ' +
             'me（我自己的判断）。这个字段决定它在提示词里的分量，标错等于把我的主张冒充成他的。\n' +
             '⚠️ **主人的原话要收进 said** —— 那是这个库里最有信息量的东西，' +
             '比你自己概括出来的规则有用得多。\n' +
             '⚠️ 加条目时 `confirmed` 默认是 false：打标是**我的判断**，可能读偏。' +
-            '主人确认之前，摘要把它们标成"待确认"。',
+            '主人确认之前，摘要把它们标成"待确认"。\n' +
+            '⚠️ **review 是一个动作、不是四个**：只给清单说"看过了"不算 —— ' +
+            '要么提交改动，要么明说 `untouched:true`（"过了一遍，没有要改的"）。' +
+            '**看完觉得没什么要改是正常结果，别为了凑数硬改**（主人原话）。',
           parameters: {
             action: {
               type: 'string',
-              enum: ['list', 'rule', 'add', 'edit', 'confirm', 'remove', 'summarize'],
-              description: 'list=看全库；rule=加原则；add=加条目；edit=改；confirm=确认；remove=删；summarize=写摘要',
+              enum: ['list', 'rule', 'add', 'edit', 'confirm', 'remove', 'summarize', 'review'],
+              description: 'list=看全库；rule=加原则；add=加条目；edit=改；confirm=确认；remove=删；summarize=写摘要；review=整库复审',
             },
             text: { type: 'string', description: 'rule/summarize 时必填：原则或规则的内容、摘要正文' },
             why: { type: 'string', description: 'rule：为什么（可空）' },
@@ -3028,6 +3553,17 @@ export function apply(root, rawConfig) {
             tags: { type: 'string', description: 'add/edit：打标，格式 color:近黑底,comp:内容压左（维度取 style/color/comp/type/texture/mood/density）' },
             id: { type: 'string', description: 'edit/confirm/remove 时必填：条目或原则的 id，先 list 看' },
             target: { type: 'string', enum: ['principle', 'item'], description: 'edit/remove 时指明改哪个（默认按 id 前缀猜）' },
+            // ★ review 专用（2026-11-21）
+            // ⚠️ 同样只能是 string：JSON 字符串由我自己拼，别写成 array/object。
+            edits: { type: 'string', description: 'review：要改哪几条，JSON 数组字符串 [{"id":"p7","text":"新说法","why_changed":"为什么改"}]' },
+            removals: { type: 'string', description: 'review：要删哪几条，JSON 数组字符串 ["p3","p9"]' },
+            untouched: { type: 'boolean', description: 'review：**过了一遍没有要改的** 就填 true —— 这是合法结果，不是偷懒' },
+            // ⚠️ `summary:true` 单独用是**假的**：它只往 reviewLog 记个标记，正文不变。
+            //    要真重写，正文得放进 summaryText。这是 2026-11-21 修的一个谎话：
+            //    工具原来无条件回"摘要也一起重压了"，而库里那段摘要还在说旧的错话。
+            summaryText: { type: 'string', description: 'review：顺手重写摘要 —— **把完整正文放这里**（限 2000 字）。不传就只是记个标记，正文不变' },
+            summary: { type: 'boolean', description: 'review：只表示"我想重压摘要"；没配套 summaryText 就只记标记，工具会明确告诉你正文没变' },
+            notes: { type: 'string', description: 'review：一句话记这次复审看出了什么（可空）' },
           },
           output: {
             schema: { type: 'json' },
@@ -3048,7 +3584,9 @@ export function apply(root, rawConfig) {
                 }
                 return Object.keys(out).length ? out : undefined
               }
-              const save = () => { if (!saveTaste(tk)) throw new Error('写盘失败（看日志）') }
+              // ★ 删东西时要把 id 当墓碑传下去（2026-11-21）。
+              //   saveTaste 会重读盘并求并集，删除的条目会被当成"别人刚加的"复活。
+              const save = (opts) => { if (!saveTaste(tk, opts)) throw new Error('写盘失败（看日志）') }
 
               /**
                * 有字段被截断时，把那句警告拼进工具消息。
@@ -3167,8 +3705,117 @@ export function apply(root, rawConfig) {
                 const isP = String(args.target || '') === 'principle' || (!args.target && id.startsWith('p'))
                 const r = isP ? removePrinciple(tk, id) : removeItem(tk, id)
                 if (!r.ok) return { ok: false, message: r.error }
-                save()
+                // ⚠️ 墓碑必须传：不传的话 saveTaste 重读盘会把它当"别人刚加的"捡回来
+                save(isP ? { deletedPrinciples: [id] } : { deletedItems: [id] })
                 return { ok: true, message: `删掉了 [${id}]。` }
+              }
+
+              // ★ review —— 整库复审（2026-11-21）
+              //
+              // 三件一个动作：看清单 → 提交改/删 → 顺手重压摘要。
+              // ⚠️ 只调一次不给 payload = 看清单，**不刷 lastReviewAt**。
+              //    这是刻意的：看清单不算复审，不然"点开看一眼"就能把该做的事糊过去。
+              if (action === 'review') {
+                const hasPayload = args.edits !== undefined || args.removals !== undefined
+                  || args.untouched === true
+                const parseArr = (v, field) => {
+                  if (v === undefined || v === null || v === '') return { ok: true, arr: [] }
+                  if (Array.isArray(v)) return { ok: true, arr: v }
+                  try {
+                    const j = JSON.parse(String(v))
+                    if (!Array.isArray(j)) return { ok: false, error: field + ' 要 JSON 数组' }
+                    return { ok: true, arr: j }
+                  } catch (e) {
+                    return { ok: false, error: field + ' 解析不了（' + (e && e.message) + '），要 JSON 数组字符串' }
+                  }
+                }
+
+                if (!hasPayload) {
+                  // 只看清单
+                  const cl = reviewChecklist(tk)
+                  const L = []
+                  L.push('## 复审清单（只摆事实，判断在你）')
+                  L.push('')
+                  if (cl.review.never) L.push('- 从装上到现在**还没复审过**。')
+                  else L.push(`- 上次复审：${cl.review.days} 天前。`)
+                  // ⚠️ 种子/学到 按**出处**分（2026-11-21 改正）。
+                  //    原来 editPrinciple 会把改过的种子标成 user，于是这两项报成
+                  //    「种子 20 / 学到的 2」—— 那两条是改了措辞的种子，不是学来的。
+                  //    现在"改过几条"单独一项，不再混进 from。
+                  L.push(`- 在用的原则 ${cl.counts.on} 条（种子 ${cl.counts.seed} / 学到的 ${cl.counts.learned}，停用 ${cl.counts.off}，改过措辞的 ${cl.counts.edited}）`)
+                  L.push(`- 条目 ${cl.counts.items} 条（待确认 ${cl.counts.unconfirmedItems}）`)
+                  // ⚠️ 「没例子」只在**不是全部**的时候才值得单列 ——
+                  //    22 条标 22 条不等于在筛东西，只是每行多三个字。
+                  if (cl.counts.bare && cl.counts.bare < cl.counts.on) {
+                    L.push(`- 没挂例子的：${cl.counts.bare} 条（其余 ${cl.counts.on - cl.counts.bare} 条有具体例子）`)
+                  } else if (cl.counts.on && cl.counts.bare === cl.counts.on) {
+                    L.push('- **全部都没挂过例子** —— 这个标记暂时筛不出东西，得先让我评过图才有例子可挂。')
+                  }
+                  if (cl.counts.contradicted) L.push(`- **有冲突标记的**：${cl.counts.contradicted} 条`)
+                  if (cl.summaryStale && cl.summaryStale.stale) L.push(`- 摘要也过期了：${cl.summaryStale.why}`)
+                  L.push('')
+                  const show = cl.rows.filter((r) => r.on)
+                  L.push('逐条（有冲突 / 改过 / 有例子的在前，其余按放置时长）：')
+                  show.sort((a, b) => Number(b.contradicted) - Number(a.contradicted)
+                    || Number(b.edited) - Number(a.edited)
+                    || b.refs.length - a.refs.length
+                    || b.ageDays - a.ageDays)
+                  for (const r of show.slice(0, 40)) {
+                    // ⚠️ 只报**这一条自己特别的地方**（2026-11-21 改正）。
+                    //    原来每行尾巴固定三段「用了 0 次｜27.8 天没动｜没例子」，
+                    //    22 行几乎一模一样，扫下来没有落点，真正该被看见的那两条
+                    //    （改过措辞的 p1/p15）反而淹在里面。共性在表头说一次就够。
+                    const flags = []
+                    if (r.contradicted) flags.push('**有冲突**')
+                    if (r.edited) flags.push(`改过 ${r.revisions} 次`)
+                    if (r.refs.length) flags.push(`有 ${r.refs.length} 个例子：${r.refs.slice(0, 2).join(' / ')}`)
+                    L.push(`- [${r.id}]${r.from === 'seed' ? '（种子）' : ''} ${r.text}`
+                      + (flags.length ? `\n  · ${flags.join('｜')}` : ''))
+                  }
+                  if (show.length > 40) L.push(`（还有 ${show.length - 40} 条没列）`)
+                  L.push('')
+                  L.push('看完之后**一个动作提交**：')
+                  L.push('- 要改：`edits` 传 JSON，如 `[{"id":"p7","text":"新说法","why_changed":"为什么改"}]`')
+                  L.push('- 要删：`removals` 传 JSON 数组，如 `["p3","p9"]`')
+                  L.push('- 顺手重写摘要：`summaryText` 放完整正文（不传就是只记标记、正文不变）')
+                  L.push('- **没什么要改的**：`untouched: true` —— 这是合法结果，不是偷懒')
+                  L.push('')
+                  L.push('⚠️ 这只是一次查看，**没有记成"复审过"**。要记上就得提交上面任意一种。')
+                  return { ok: true, message: L.join('\n') }
+                }
+
+                const pe = parseArr(args.edits, 'edits')
+                if (!pe.ok) return { ok: false, message: pe.error }
+                const pr = parseArr(args.removals, 'removals')
+                if (!pr.ok) return { ok: false, message: pr.error }
+                const rv = applyReview(tk, {
+                  edits: pe.arr,
+                  removals: pr.arr,
+                  untouched: args.untouched === true,
+                  summary: args.summary === true,
+                  // ★ 摘要正文走这里。只传 summary:true 不传正文 = 只记标记，正文不变。
+                  summaryText: args.summaryText,
+                  notes: args.notes,
+                })
+                if (!rv.ok) return { ok: false, message: rv.error }
+                // ⚠️ 墓碑必须传 —— 这轮实测踩过：工具回了"删了"，盘上一条没少
+                save({ deletedPrinciples: rv.deletedPrinciples })
+                const bits = []
+                if (rv.changed.length) bits.push(`改了 ${rv.changed.length} 条（${rv.changed.join(' / ')}）`)
+                if (rv.removed.length) bits.push(`删了 ${rv.removed.length} 条（${rv.removed.join(' / ')}）`)
+                if (rv.untouched) bits.push('过了一遍，**没有要改的**')
+                // ⚠️ 只有正文真写进去了才说"重压了"。原来无条件说，是假话。
+                if (rv.summaryWritten) bits.push('摘要也一起重写了')
+                const st = summaryStale(tk)
+                return {
+                  ok: true,
+                  message: `复审记上了：${bits.join('；')}。\n`
+                    + (rv.warnings.length ? `\n⚠️ 有些没生效：\n  - ${rv.warnings.join('\n  - ')}\n` : '')
+                    + (rv.summaryWritten ? '' : (st.stale
+                      ? `\n⚠️ 摘要还是过期的（${st.why}）—— 复审时把新正文放进 \`summaryText\` 一起提交，就不用再单独调一次 summarize。`
+                      : '\n摘要是最新的。'))
+                    + '\n下次到期：7 天后。',
+                }
               }
 
               // summarize
@@ -3556,6 +4203,10 @@ export function apply(root, rawConfig) {
                   stats: tasteStats(taste),
                   summary: taste.summary,
                   summaryStale: summaryStale(taste),
+                  // ★ 复审到期（2026-11-21）—— 设置页要能看见"该过一遍了"
+                  review: staleForReview(taste),
+                  lastReviewAt: Number(taste.lastReviewAt) || 0,
+                  reviewLog: Array.isArray(taste.reviewLog) ? taste.reviewLog.slice(-5) : [],
                   dims: TAG_DIMS,
                   principles: taste.principles,
                   items: taste.items,
@@ -3565,8 +4216,8 @@ export function apply(root, rawConfig) {
                 return readBody(req, (body, err) => {
                   if (err) return send({ ok: false, error: 'body 不是合法 JSON' }, 400)
                   const a = String(body.action || '')
-                  const done = () => {
-                    if (!saveTaste(taste)) return send({ ok: false, error: '写盘失败（看日志）' }, 500)
+                  const done = (opts) => {
+                    if (!saveTaste(taste, opts)) return send({ ok: false, error: '写盘失败（看日志）' }, 500)
                     return send({ ok: true, stats: tasteStats(taste), summary: taste.summary,
                       principles: taste.principles, items: taste.items,
                       // ⚠️ 把"哪几个字段被截了"也转出去。
@@ -3577,6 +4228,8 @@ export function apply(root, rawConfig) {
                       truncated: (r && Array.isArray(r.truncated) && r.truncated.length) ? r.truncated : undefined })
                   }
                   let r
+                  // 删除时的墓碑，见 delPrinciple / delItem
+                  let delOpts
                   if (a === 'addPrinciple') {
                     r = addPrinciple(taste, body.text, { why: body.why, unless: body.unless, by: body.by })
                   } else if (a === 'editPrinciple') {
@@ -3585,6 +4238,8 @@ export function apply(root, rawConfig) {
                     })
                   } else if (a === 'delPrinciple') {
                     r = removePrinciple(taste, String(body.id || ''))
+                    // ⚠️ 设置页删东西也要传墓碑，否则刷新一下又回来了
+                    if (r && r.ok) delOpts = { deletedPrinciples: [String(body.id || '')] }
                   } else if (a === 'addItem') {
                     r = addItem(taste, {
                       ref: body.ref, kind: body.kind, tags: body.tags, note: body.note,
@@ -3599,6 +4254,7 @@ export function apply(root, rawConfig) {
                     })
                   } else if (a === 'delItem') {
                     r = removeItem(taste, String(body.id || ''))
+                    if (r && r.ok) delOpts = { deletedItems: [String(body.id || '')] }
                   } else if (a === 'summary') {
                     const s = tasteStats(taste)
                     r = setSummary(taste, String(body.text || ''), s.principlesOn + s.items)
@@ -3606,7 +4262,7 @@ export function apply(root, rawConfig) {
                     return send({ ok: false, error: '未知 action：' + a }, 400)
                   }
                   if (r && r.ok === false) return send({ ok: false, error: r.error }, 400)
-                  return done()
+                  return done(delOpts)
                 })
               }
               return send({ ok: false, error: '只支持 GET / POST' }, 405)

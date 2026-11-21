@@ -206,6 +206,14 @@ export function blankTaste() {
     //    那里是白名单式的重建，漏一个就"写进去能用、一重启就没"，而且不报错。
     //    （本轮就是这么发现 touchedAt 会被丢的。）
     touchedAt: 0,
+    // ★ 上次**整库复审**的时间（不是"哪条被改了"，是"我坐下来过过一遍"）。
+    //   ⚠️ 刻意不复用 touchedAt / summaryStale：
+    //      touchedAt 的语义是"内容改过"，summaryStale 的语义是"摘要过期了"。
+    //      而这里是"原则该被质疑一遍了" —— 三件不同的事，混用一个字段
+    //      以后两边都读不准。
+    lastReviewAt: 0,
+    // 复审流水（只记"做了没有、动了几条"，不记内容 —— 内容在 revisions 里）
+    reviewLog: [],
     // 通用原则 + 主人给的规则，同一张表靠 from 区分
     principles: SEED_PRINCIPLES.map((p, i) => ({
       id: 'p' + (i + 1),
@@ -216,6 +224,13 @@ export function blankTaste() {
       by: 'me',
       on: true,
       at: now,
+      // ★ 这三个字段是给"复审"用的，见下面 reviewChecklist。
+      //   evidence  : 指向 items 的 id —— 哪几个具体例子支撑/推翻了这条
+      //   revisions : 改过什么（保留旧文本，别让它无声消失）
+      //   contradicts: 和哪几条打架
+      evidence: [],
+      revisions: [],
+      contradicts: [],
     })),
     // 带正反例的条目（作品 / 图片）
     items: [],
@@ -238,6 +253,9 @@ export function migrateTaste(t) {
     summary: t.summary && typeof t.summary === 'object' ? t.summary : null,
     // ⚠️ 别漏这个 —— 它是白名单，漏了就"写进去能用、一重启就没了"，还不报错。
     touchedAt: Number(t.touchedAt) || 0,
+    // ★ 复审那两个也是白名单的一部分 —— 2026-11-21 加的。
+    lastReviewAt: Number(t.lastReviewAt) || 0,
+    reviewLog: Array.isArray(t.reviewLog) ? t.reviewLog.slice(-20) : [],
   }
   // 逐条补齐
   out.principles = out.principles.map((p, i) => ({
@@ -252,6 +270,22 @@ export function migrateTaste(t) {
       : (p.from === 'user' ? 'owner' : 'me'),
     on: p.on !== false,
     at: Number(p.at) || 0,
+    // ★ 复审三件套。老数据补默认值 —— 不补的话渲染时读到 undefined 会崩。
+    //   evidence 只留真实存在的 item id（删条目之后会留下悬空引用，这里顺手清掉）。
+    evidence: Array.isArray(p.evidence)
+      ? p.evidence.map((x) => String(x)).filter((x) => x)
+      : [],
+    revisions: Array.isArray(p.revisions)
+      ? p.revisions.filter((r) => r && typeof r === 'object').map((r) => ({
+        at: Number(r.at) || 0,
+        from: String(r.from || ''),
+        to: String(r.to || ''),
+        why: String(r.why || ''),
+      })).slice(-10)
+      : [],
+    contradicts: Array.isArray(p.contradicts)
+      ? p.contradicts.map((x) => String(x)).filter((x) => x)
+      : [],
   })).filter((p) => p.text)
   out.items = out.items.map((x, i) => ({
     id: String(x.id || ('i' + (i + 1))),
@@ -304,26 +338,40 @@ export function loadTaste() {
  *   · **同一个 id 两边都有** → 以**这次传入的**为准（它是本次调用的意图）
  *   · 顺序：先按盘上的排，再把新增的追加在后面
  */
-function mergeById(diskArr, nextArr) {
+function mergeById(diskArr, nextArr, tomb = null) {
   const a = Array.isArray(diskArr) ? diskArr : []
   const b = Array.isArray(nextArr) ? nextArr : []
-  const key = (x) => (x && (x.id || x.text || JSON.stringify(x))) || ''
+  // ⚠️ key 必须**统一成字符串**。原来是 `(x.id || x.text || ...) || ''`，
+  //    数字 id 返回的是 number，而墓碑集合里存的是 String(id) —— `dead.has(7)`
+  //    对着 Set(['7']) 永远是 false，数字 id 的删除就会失效。现在 id 都是
+  //    字符串（p1 / pmvnooysl1 / imvv11e7c1），但别把这条依赖留在这儿。
+  const key = (x) => String((x && (x.id || x.text || JSON.stringify(x))) || '')
   const bMap = new Map(b.map((x) => [key(x), x]))
+  // ★ 墓碑：这次**主动删掉**的 id。
+  //   ⚠️ 没有它的时候，"盘上有、这次没有 → 保留"这条并集规则会把删除
+  //      当成"别的对话刚加的"再塞回来 —— 于是删除永远不生效，
+  //      而且工具已经回了"删了"，日志也记了"删了"。实测踩到：
+  //      review 说删掉 pmvnooysl1，盘上 23 条一条没少。
+  const dead = tomb instanceof Set ? tomb : new Set(
+    Array.isArray(tomb) ? tomb.map((x) => String(x)) : []
+  )
   const out = []
   const seen = new Set()
   for (const x of a) {                       // 盘上的顺序先摆好
     const k = key(x)
+    if (dead.has(k)) continue               // 这次删的，别再捡回来
     seen.add(k)
     out.push(bMap.has(k) ? bMap.get(k) : x)  // 同一 id → 用这次的
   }
   for (const x of b) {                       // 再把这次新增的追加
     const k = key(x)
+    if (dead.has(k)) continue
     if (!seen.has(k)) { seen.add(k); out.push(x) }
   }
   return out
 }
 
-export function saveTaste(t) {
+export function saveTaste(t, opts = {}) {
   try {
     const p = tasteFile()
     mkdirSync(dirname(p), { recursive: true })
@@ -333,6 +381,11 @@ export function saveTaste(t) {
     //    A 写的 tmp 会被 B 覆盖，然后 A 拿着 B 的 tmp rename 成"自己的库"。
     const tmp = p + '.' + process.pid + '.' + Math.random().toString(36).slice(2, 8) + '.tmp'
 
+    // ★ 墓碑（2026-11-21）：这次主动删掉的 id，合并时不许复活。
+    //   不传就是空集合 —— 老的调用点行为完全不变（只是"加"和"改"）。
+    const tombP = new Set((opts.deletedPrinciples || []).map(String))
+    const tombI = new Set((opts.deletedItems || []).map(String))
+
     // ⚠️ **写之前重读盘上的那份并合并** —— 见上面 mergeById 的说明。
     //    不这么做就是"最后写入者赢"，而两边都在写。
     let merged = t
@@ -340,8 +393,8 @@ export function saveTaste(t) {
       const disk = loadTaste()
       merged = {
         ...t,
-        principles: mergeById(disk.principles, t.principles),
-        items: mergeById(disk.items, t.items),
+        principles: mergeById(disk.principles, t.principles, tombP),
+        items: mergeById(disk.items, t.items, tombI),
         // summary 是"压出来的"，通常只有一边会动它 ——
         // 这次没带就用盘上的，带了就用这次的
         summary: (t.summary && Object.keys(t.summary).length) ? t.summary : disk.summary,
@@ -404,6 +457,11 @@ export function addPrinciple(t, text, opts = {}) {
     by,
     on: true,
     at: Date.now(),
+    // ★ 复审三件套（2026-11-21）—— 新加的原则一开始就是"没被验证过"，
+    //   这不是缺陷，是它的真实状态。别为了好看填一个假的时间。
+    evidence: [],
+    revisions: [],
+    contradicts: [],
   }
   t.principles.push(p)
   t.touchedAt = Date.now()   // ⚠️ 不清摘要 —— 见上面 saveTaste 那段说明；由 summaryStale 负责提示
@@ -418,7 +476,7 @@ export function removePrinciple(t, id) {
   return { ok: true, principle: p }
 }
 
-/** 改一条（主人改过的自动标成 user） */
+/** 改一条 */
 export function editPrinciple(t, id, patch = {}) {
   const p = t.principles.find((x) => x.id === id)
   if (!p) return { ok: false, error: '没找到 ' + id }
@@ -426,10 +484,16 @@ export function editPrinciple(t, id, patch = {}) {
   if (typeof patch.why === 'string') p.why = patch.why.trim()
   if (typeof patch.unless === 'string') p.unless = patch.unless.trim()
   if (patch.on === true || patch.on === false) p.on = patch.on
-  // ★ 只要动过，就算他的了 —— 哪怕只改了一个字。
-  //   ⚠️ 但 by **不动**：主人把一条种子改了个字，主意仍然是我的（by 还是 me），
-  //      只是他认可了。两个字段管的是两件事，不能一起改。
-  if (patch.text !== undefined || patch.why !== undefined || patch.unless !== undefined) p.from = 'user'
+  // ⚠️ **`from` 绝对不要在这里改**（2026-11-21 改正）。
+  //
+  //    原来这里写的是 `p.from = 'user'`，理由是"只要动过就算他的了"。
+  //    但 `from` 回答的是**谁提出来的**，不是"后来谁碰过"。把种子改一个字
+  //    就变成"user"，于是清单里报「种子 20 / 学到的 2」—— 那两条明明是我
+  //    写下的种子，只是我复审时收紧了措辞，却成了"学到的"。
+  //    两个问题混进一个字段，两边都读不准。
+  //
+  //    "改过没有"用 revisions 判断（下面 applyReview 会 push 进去），
+  //    不要拿 from 兼职。`by` 同理，也不动。
   t.touchedAt = Date.now()
   return { ok: true, principle: p }
 }
@@ -658,6 +722,219 @@ export function summaryStale(t) {
   return { stale: false, now }
 }
 
+// ─────────────────────────────────────────────────────────────
+// 整库复审（2026-11-21）
+//
+// 主人原话：「你不能自己写完就固定了，你还要更新」。
+// 以及：「如果没有更新的必要也不要强行更新」。
+//
+// 这三样是**一个动作**，不能拆开做：
+//   ① 过一遍原则（删 / 改 / 留给下一轮）
+//   ② 重压摘要
+//   ③ 刷 lastReviewAt
+// 拆开就会出现"摘要重写了但原则没复审"或者反过来，两边都是假动作。
+//
+// ⚠️ 这三件事跟 touchedAt / summaryStale **刻意分开**：
+//    touchedAt     = 内容被改过（写摘要时清零）
+//    summaryStale  = 摘要过期了（库涨了三成，或内容改过）
+//    lastReviewAt  = 我坐下来把整库质疑过一遍
+//    混用一个字段，以后两边都读不准。
+// ─────────────────────────────────────────────────────────────
+
+/** 多久没复审就该提示了（天） */
+const REVIEW_DAYS = 7
+const REVIEW_MS = REVIEW_DAYS * 24 * 60 * 60 * 1000
+
+/**
+ * 该不该提示"过一遍"。
+ *
+ * ⚠️ 从没复审过的时候不能直接判 due —— 那样一装上就天天催。
+ *    拿库里**最早的那条原则**当起点，够 7 天了才催。
+ */
+export function staleForReview(t, now = Date.now()) {
+  const total = t.principles.filter((p) => p.on).length + (t.items || []).length
+  const last = Number(t.lastReviewAt) || 0
+  let basis = last
+  if (!basis) {
+    const ats = t.principles.map((p) => Number(p.at) || 0).filter((x) => x > 0)
+    basis = ats.length ? Math.min(...ats) : 0
+  }
+  if (!basis) return { due: false, never: true, days: 0, total, lastReviewAt: last }
+  return {
+    due: now - basis >= REVIEW_MS,
+    never: !last,
+    days: Math.round(((now - basis) / 86400000) * 10) / 10,
+    total,
+    lastReviewAt: last,
+  }
+}
+
+/**
+ * 复审清单 —— **只摆事实，不给结论**。
+ *
+ * ⚠️ 为什么不给"建议删掉 p7"这种结论：那跟每周自动生成一段"本周品味更新"
+ *    是一回事，只是换了个形状。清单负责让我看见"这条没人用过""这两条打架"，
+ *    判断由我做。
+ *
+ * 每条原则交出去的东西：
+ *   refs         evidence 里能对上的具体例子（挂着的 id 顺手过滤掉）
+ *   bare         一条例子都没有 —— 它可能是我凭空想的
+ *   contradicted 有条目标着"这条跟它打架"（谁标的谁负责解释）
+ *   ageDays      多久没动过
+ */
+export function reviewChecklist(t, now = Date.now()) {
+  const items = Array.isArray(t.items) ? t.items : []
+  const byId = new Map(items.map((x) => [x.id, x]))
+  const rows = t.principles.map((p) => {
+    const ev = Array.isArray(p.evidence) ? p.evidence : []
+    const refs = ev.map((id) => byId.get(id)).filter(Boolean).map((x) => x.ref)
+    return {
+      id: p.id,
+      text: p.text,
+      on: p.on !== false,
+      // ⚠️ from 现在**只表示"谁提出来的"**（2026-11-21 改正）。
+      //    原来 editPrinciple 会把改过的种子标成 user，于是"谁说的"和"谁改的"
+      //    挤进同一个字段，清单里报出「种子 20 / 学到的 2」—— 那两条根本不是学来的。
+      //    "改过没有"看下面的 revisions。
+      from: p.from === 'seed' ? 'seed' : 'user',
+      by: p.by || 'me',
+      refs,
+      bare: refs.length === 0,
+      contradicted: Array.isArray(p.contradicts) && p.contradicts.length > 0,
+      ageDays: p.at ? Math.round(((now - p.at) / 86400000) * 10) / 10 : 0,
+      revisions: Array.isArray(p.revisions) ? p.revisions.length : 0,
+      // ★ 改过没有，单独一个字段。别让调用方再从 from 里猜。
+      edited: Array.isArray(p.revisions) && p.revisions.length > 0,
+    }
+  })
+  const s = summaryStale(t)
+  const onRows = rows.filter((r) => r.on)
+  return {
+    at: now,
+    review: staleForReview(t, now),
+    rows,
+    counts: {
+      on: rows.filter((r) => r.on).length,
+      off: rows.filter((r) => !r.on).length,
+      bare: onRows.filter((r) => r.bare).length,
+      contradicted: rows.filter((r) => r.contradicted).length,
+      // seed / learned 按**出处**分，不按"改过没改过"
+      seed: rows.filter((r) => r.from === 'seed').length,
+      learned: rows.filter((r) => r.from !== 'seed').length,
+      edited: rows.filter((r) => r.edited).length,
+      items: items.length,
+      unconfirmedItems: items.filter((x) => !x.confirmed).length,
+    },
+    summaryStale: s,
+  }
+}
+
+/**
+ * 提交一次复审。
+ *
+ * payload:
+ *   edits    [{ id, text?, why?, unless?, on?, why_changed? }]
+ *   removals [id, ...]
+ *   summary  true = 这次也重压了摘要（正文走 setSummary，不走这里）
+ *   untouched true = **过了一遍，没有要改的**
+ *   notes    一句话，记这次复审看出了什么
+ *
+ * ⚠️ 两条硬规矩：
+ *   1. 什么都不提交会报错 —— 「没看」和「看了觉得没要改」必须能区分开。
+ *   2. 删掉的条目只能进 reviewLog（原则本身没了，revisions 就没地方挂）。
+ */
+export function applyReview(t, payload = {}, now = Date.now()) {
+  const edits = Array.isArray(payload.edits) ? payload.edits : []
+  const removals = Array.isArray(payload.removals) ? payload.removals : []
+  const notes = String(payload.notes || '').trim().slice(0, 1000)
+  const didSummary = payload.summary === true
+  const untouched = payload.untouched === true
+
+  if (!edits.length && !removals.length && !untouched) {
+    return {
+      ok: false,
+      error: '一次复审要么给出改动（edits / removals），要么明确 untouched:true 表示"过了一遍，没有要改的"。'
+        + '什么都不说等于没看 —— 那 lastReviewAt 就会被刷成一个假的时间。',
+    }
+  }
+
+  const changed = []
+  const changedWhy = []
+  for (const e of edits) {
+    if (!e || typeof e !== 'object') continue
+    const p = t.principles.find((x) => x.id === String(e.id || ''))
+    if (!p) { changedWhy.push(`${e.id}：没找到`); continue }
+    const before = { text: p.text, why: p.why, unless: p.unless, on: p.on }
+    const r = editPrinciple(t, p.id, e)
+    if (!r.ok) { changedWhy.push(`${p.id}：${r.error}`); continue }
+    // 改了什么、为什么改，一起进 revisions —— 旧文本不能无声消失。
+    const keys = ['text', 'why', 'unless']
+    for (const k of keys) {
+      if (String(before[k] || '') !== String(p[k] || '')) {
+        p.revisions.push({ at: now, from: String(before[k] || ''), to: String(p[k] || ''), why: String(e.why_changed || notes || '').slice(0, 200) })
+      }
+    }
+    if (p.revisions.length > 10) p.revisions = p.revisions.slice(-10)
+    changed.push(p.id)
+  }
+
+  const removed = []
+  for (const id of removals) {
+    const r = removePrinciple(t, String(id))
+    if (r.ok) removed.push(String(id))
+    else changedWhy.push(`${id}：${r.error}`)
+  }
+
+  // ★ 重压摘要（2026-11-21 补）。
+  //
+  //   ⚠️ 上一版的 `summary: true` 是**假的**：它只往 reviewLog 记了个标记，
+  //      摘要正文一个字没动，fromCount 也没重算。于是工具回"摘要也一起重压了"，
+  //      而库里那段摘要还在写着被改掉前的旧说法（p1「最多两种」/ p15「必须完全一致」）——
+  //      摘要在跟原则正文互相打脸。
+  //
+  //   所以现在分两种，**说清楚哪种发生了**：
+  //     传了 summaryText → 真的写进去（顺带把 touchedAt 清零、fromCount 重算）
+  //     只传 summary:true → 不假装重压了，明确告诉调用方正文没变
+  let summaryWritten = false
+  const summaryText = String(payload.summaryText || '').trim()
+  if (summaryText) {
+    // 在 edits/removals 之后写，fromCount 采到的是**复审后**的库大小
+    const s = stats(t)
+    const r = setSummary(t, summaryText, s.principlesOn + s.items)
+    if (!r.ok) changedWhy.push(`摘要没写成：${r.error}`)
+    else summaryWritten = true
+  } else if (didSummary) {
+    changedWhy.push('`summary:true` 只是记了个标记 —— 摘要正文没变。要真重写就把正文放进 `summaryText`。')
+  }
+
+  t.lastReviewAt = now
+  t.reviewLog = Array.isArray(t.reviewLog) ? t.reviewLog : []
+  t.reviewLog.push({
+    at: now,
+    changed,
+    removed,
+    untouched: untouched && !changed.length && !removed.length,
+    // 记的是"摘要正文被重写了吗"，不是"调用方想不想重压"
+    summary: summaryWritten,
+    notes,
+  })
+  if (t.reviewLog.length > 20) t.reviewLog = t.reviewLog.slice(-20)
+
+  return {
+    ok: true,
+    changed,
+    removed,
+    untouched: untouched && !changed.length && !removed.length,
+    summary: summaryWritten,
+    summaryWritten,
+    warnings: changedWhy,
+    lastReviewAt: now,
+    // ★ 交给调用方去 saveTaste —— 删掉的 id 必须当墓碑传下去，
+    //   否则 mergeById 会把它们从盘上捡回来（见 saveTaste 的说明）。
+    deletedPrinciples: removed,
+  }
+}
+
 /**
  * 注入系统提示词的那一段。
  *
@@ -675,8 +952,8 @@ export function summaryStale(t) {
 export function renderForPrompt(t0, opts = {}) {
   // ⚠️ 传进来 undefined / null 不能炸 —— 提示词段一出错就把整轮上下文带崩。
   const t = t0 && typeof t0 === 'object'
-    ? { principles: Array.isArray(t0.principles) ? t0.principles : [], items: Array.isArray(t0.items) ? t0.items : [], summary: t0.summary || null }
-    : { principles: [], items: [], summary: null }
+    ? { principles: Array.isArray(t0.principles) ? t0.principles : [], items: Array.isArray(t0.items) ? t0.items : [], summary: t0.summary || null, lastReviewAt: Number(t0.lastReviewAt) || 0 }
+    : { principles: [], items: [], summary: null, lastReviewAt: 0 }
   // ⚠️ 别写成 `Number(x) || 14` —— 那样 0 会被当成假值吃掉，
   //    "一条原则都不列"就表达不出来（调试时踩到的）。
   const numOr = (v, d) => (Number.isFinite(Number(v)) && String(v).trim() !== '' ? Math.max(0, Number(v)) : d)
@@ -895,6 +1172,22 @@ export function renderForPrompt(t0, opts = {}) {
   const st = summaryStale(t)
   if (st.stale && s.principlesOn + s.items >= 12) {
     L.push(`> 库该重压了（${st.why}）。有空的时候调 \`taste {action:'summarize'}\` 写一段新的。`)
+  }
+
+  // ★ 复审到期提示（2026-11-21）。
+  //
+  //   ⚠️ 只放**一行字和一个数字**，不放清单 ——
+  //      清单每轮都变（谁被改了、哪条没例子），塞进提示词前缀会每轮冲掉缓存。
+  //      要看清单就调 `taste {action:'review'}`。
+  //
+  //   ⚠️ 措辞刻意留了"可以什么都不改"这个出口。
+  //      主人原话：「如果没有更新的必要也不要强行更新」——
+  //      只写"该复审了"会把我往"凑几条改动"上推。
+  const rv = staleForReview(t)
+  if (rv.due) {
+    L.push(`> 品味库到该过一遍的时候了（${rv.never ? '从装上到现在还没复审过' : `上次复审是 ${rv.days} 天前`}）。`
+      + `先调 \`taste {action:'review'}\` 看清单，再决定改哪几条 —— **看完觉得没什么要改也是正常结果**，`
+      + `那就明说没改，别为了凑数硬改。`)
   }
 
   return L.join('\n')
