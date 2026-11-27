@@ -289,6 +289,22 @@ export function scanAll(sessionsDir, opt = {}) {
     let st
     try { st = statSync(f) } catch { continue }
     if (opt.minBytes && st.size < opt.minBytes) continue
+    // ⚠️ **没变过的会话直接沿用旧摘要，一个字节都不读。**
+    //    这一条是启动慢的主犯：原来每个会话文件都要整读 + 逐字节找 zstd 帧 + 逐帧解压。
+    //    157 个会话实测 4.8 秒，而且是**同步**的 —— 那 4.8 秒里事件循环整个卡死。
+    //    而 mtime 和 size 都没变的文件，内容必然没变：(mtime, size) 就是它的指纹。
+    //    调用方传 known = 上次存的索引（loadIndex 的 sessions）即可。
+    if (opt.known) {
+      const k = opt.known[name]
+      // 还要 k.sum 在 —— 旧索引若没存摘要，复用它等于把那条会话变成空白条目
+      if (k && k.mtime === st.mtimeMs && k.size === st.size && k.sum) {
+        out[name] = {
+          file: f, mtime: st.mtimeMs, size: st.size,
+          header: k.header || null, sum: k.sum || null, cached: true,
+        }
+        continue
+      }
+    }
     try {
       const { header, msgs } = extractSession(f, opt)
       if (!msgs.length) continue
